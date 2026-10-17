@@ -39,6 +39,7 @@ constexpr UINT WM_APP_APPLY_PROGRESS = WM_APP + 3;
 constexpr UINT WM_APP_APPLY_PAUSED = WM_APP + 4;
 constexpr UINT WM_APP_APPLY_COMPLETE = WM_APP + 5;
 constexpr UINT WM_APP_FILTER_COLUMN = WM_APP + 6;
+constexpr wchar_t SINGLE_INSTANCE_MUTEX_NAME[] = L"Local\\MT5SymbolManager.SingleInstance";
 constexpr int IDC_PROFILE = 1001;
 constexpr int IDC_LOGIN = 1002;
 constexpr int IDC_PASSWORD = 1003;
@@ -1621,6 +1622,26 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+    HANDLE singleInstanceMutex = CreateMutexW(nullptr, TRUE, SINGLE_INSTANCE_MUTEX_NAME);
+    if (!singleInstanceMutex) {
+        MessageBoxW(nullptr, L"Unable to check whether MT5 Symbol Manager is already running.",
+            L"MT5 Symbol Manager", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existingWindow = FindWindowW(L"MT5SymbolManagerMainWindow", nullptr);
+        if (existingWindow) {
+            if (IsIconic(existingWindow)) ShowWindow(existingWindow, SW_RESTORE);
+            else ShowWindow(existingWindow, SW_SHOW);
+            SetForegroundWindow(existingWindow);
+        } else {
+            MessageBoxW(nullptr, L"MT5 Symbol Manager is already running.",
+                L"MT5 Symbol Manager", MB_OK | MB_ICONINFORMATION);
+        }
+        CloseHandle(singleInstanceMutex);
+        return 0;
+    }
+
     instanceHandle = instance;
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES};
     InitCommonControlsEx(&controls);
@@ -1795,5 +1816,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
+    ReleaseMutex(singleInstanceMutex);
+    CloseHandle(singleInstanceMutex);
     return static_cast<int>(message.wParam);
 }

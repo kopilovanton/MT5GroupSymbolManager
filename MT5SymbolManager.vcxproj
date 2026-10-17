@@ -49,6 +49,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
+      <LinkTimeCodeGeneration Condition="'$(Configuration)|$(Platform)'=='Release|x64'">UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
       <AdditionalDependencies>comctl32.lib;comdlg32.lib;shell32.lib;shlwapi.lib;ole32.lib;oleaut32.lib;xmllite.lib;uuid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
