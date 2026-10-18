@@ -163,6 +163,7 @@ std::shared_ptr<AsyncState> asyncState = std::make_shared<AsyncState>();
 std::shared_ptr<ApplyAsyncState> applyAsyncState = std::make_shared<ApplyAsyncState>();
 std::shared_ptr<ApplyControlState> applyControlState = std::make_shared<ApplyControlState>();
 std::atomic_bool operationRunning = false;
+bool closeAfterOperation = false;
 std::thread fetchWorker;
 std::thread importWorker;
 std::thread applyWorker;
@@ -202,6 +203,7 @@ std::vector<ColumnFilter> columnFilters;
 std::vector<std::size_t> visibleRows;
 std::vector<std::size_t> pinnedColumnIndices;
 std::vector<std::size_t> scrollableColumnIndices;
+std::vector<bool> dividerBeforeColumns;
 bool syncingTableScroll = false;
 bool syncingTableSelection = false;
 int pinnedSymbolColumnWidth = PINNED_SYMBOL_COLUMN_WIDTH;
@@ -218,6 +220,22 @@ std::size_t snapshotColumnForView(HWND view, int localColumn) {
         return (std::numeric_limits<std::size_t>::max)();
     }
     return columns[static_cast<std::size_t>(localColumn)];
+}
+
+bool isColumnDividerBefore(std::size_t snapshotColumn) {
+    return snapshotColumn < dividerBeforeColumns.size() &&
+        dividerBeforeColumns[snapshotColumn];
+}
+
+void drawColumnDivider(HDC dc, int x, int top, int bottom) {
+    if (!dc || bottom <= top) return;
+    HPEN pen = CreatePen(PS_SOLID, 2, GetSysColor(COLOR_3DSHADOW));
+    if (!pen) return;
+    HGDIOBJ previousPen = SelectObject(dc, pen);
+    MoveToEx(dc, x, top, nullptr);
+    LineTo(dc, x, bottom);
+    SelectObject(dc, previousPen);
+    DeleteObject(pen);
 }
 
 int localColumnForSnapshot(HWND view, std::size_t snapshotColumn) {
@@ -449,6 +467,12 @@ std::wstring getText(HWND control) {
 
 void setStatus(const std::wstring& text) {
     if (statusText) SetWindowTextW(statusText, text.c_str());
+}
+
+void closeWhenOperationFinishes() {
+    if (!closeAfterOperation || operationRunning.load()) return;
+    closeAfterOperation = false;
+    if (mainWindow && IsWindow(mainWindow)) PostMessageW(mainWindow, WM_CLOSE, 0, 0);
 }
 
 void setControlTreeFont(HWND parent, HFONT font) {
@@ -1147,6 +1171,18 @@ void updateCredentials() {
 
 void addTableColumns() {
     columnFilters.assign(currentSnapshot.columns.size(), ColumnFilter{});
+    dividerBeforeColumns.assign(currentSnapshot.columns.size(), false);
+    const std::size_t sourceColumnCount = (std::min)(currentSnapshot.columns.size(),
+        currentSnapshot.sourceNames.size());
+    for (std::size_t column = 0; column < sourceColumnCount; ++column) {
+        const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
+            [sourceName = currentSnapshot.sourceNames[column]](const SymbolFieldMapping& field) {
+                return field.sourceName == sourceName;
+            });
+        if (mapping != symbolFieldMappings.end()) {
+            dividerBeforeColumns[column] = mapping->dividerBefore;
+        }
+    }
     pinnedColumnIndices.clear();
     scrollableColumnIndices.clear();
     for (const std::wstring_view pinnedName : {std::wstring_view(L"Symbol"), std::wstring_view(L"Path")}) {
@@ -1228,7 +1264,7 @@ bool selectedProfile(ConnectionProfile& profile) {
     return true;
 }
 
-void startFetch() {
+void startFetch(bool preserveCurrentData = false) {
     bool expected = false;
     if (!operationRunning.compare_exchange_strong(expected, true)) return;
 
@@ -1250,9 +1286,10 @@ void startFetch() {
         return;
     }
 
-    clearTable();
+    if (!preserveCurrentData) clearTable();
     setBusy(true);
-    setStatus(L"Connecting to " + profile.name + L" and retrieving symbol parameters...");
+    setStatus((preserveCurrentData ? L"Refreshing symbol parameters from " : L"Connecting to ") +
+        profile.name + L" and retrieving symbol parameters...");
 
     const HWND window = mainWindow;
     const std::shared_ptr<AsyncState> state = asyncState;
@@ -1309,6 +1346,7 @@ void showFetchResult() {
         return;
     }
 
+    clearTable(true);
     currentSnapshot = std::move(result->snapshot);
     serverSnapshot = currentSnapshot;
     manualEditBaseline = currentSnapshot;
@@ -1332,15 +1370,17 @@ void showFetchResult() {
 void exportSnapshot() {
     if (currentSnapshot.columns.empty() || operationRunning.load()) return;
 
-    wchar_t path[32768] = L"MT5Symbols.xlsx";
+    std::vector<wchar_t> path(32768, L'\0');
+    static constexpr wchar_t defaultFileName[] = L"MT5Symbols.xlsx";
+    std::copy(std::begin(defaultFileName), std::end(defaultFileName), path.begin());
     static constexpr wchar_t filter[] =
         L"Excel Workbook (*.xlsx)\0*.xlsx\0All files (*.*)\0*.*\0\0";
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner = mainWindow;
     dialog.lpstrFilter = filter;
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = static_cast<DWORD>(std::size(path));
+    dialog.lpstrFile = path.data();
+    dialog.nMaxFile = static_cast<DWORD>(path.size());
     dialog.lpstrTitle = L"Export symbol parameters to Excel";
     dialog.lpstrDefExt = L"xlsx";
     dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT |
@@ -1355,7 +1395,7 @@ void exportSnapshot() {
     setStatus(L"Exporting symbol parameters to Excel...");
     UpdateWindow(statusText);
     std::wstring error;
-    if (ExportSnapshotToXlsx(currentSnapshot, path, error)) {
+    if (ExportSnapshotToXlsx(currentSnapshot, std::wstring(path.data()), error)) {
         setStatus(L"Exported " + std::to_wstring(currentSnapshot.rows.size()) +
             L" symbols and " + std::to_wstring(currentSnapshot.columns.size()) +
             L" parameters to Excel.");
@@ -1363,6 +1403,17 @@ void exportSnapshot() {
         setStatus(error);
         MessageBoxW(mainWindow, error.c_str(), L"Excel export failed", MB_OK | MB_ICONERROR);
     }
+}
+
+bool isRemovedVolumeExtHeading(std::wstring_view heading) {
+    static constexpr std::wstring_view removedHeadings[] = {
+        L"VolumeMinExt", L"VolumeMaxExt", L"VolumeStepExt", L"VolumeLimitExt",
+        L"IeVolumeMinExtAcc", L"IeVolumeMaxExtAcc", L"IeVolumeStepExtAcc", L"IeVolumeLimitExtAcc",
+        L"Execution.IeVolumeMinExtAcc", L"Execution.IeVolumeMaxExtAcc",
+        L"Execution.IeVolumeStepExtAcc", L"Execution.IeVolumeLimitExtAcc"
+    };
+    return std::find(std::begin(removedHeadings), std::end(removedHeadings), heading) !=
+        std::end(removedHeadings);
 }
 
 bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
@@ -1398,6 +1449,7 @@ bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
         }
         const auto expected = expectedColumns.find(heading);
         if (expected == expectedColumns.end()) {
+            if (isRemovedVolumeExtHeading(heading)) continue;
             error = L"The workbook contains unknown column '" + heading + L"'. Check that it was exported with the current symbols.ini.";
             return false;
         }
@@ -1447,15 +1499,15 @@ bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
 
 void loadExcelWorkbook() {
     if (operationRunning.load()) return;
-    wchar_t path[32768]{};
+    std::vector<wchar_t> path(32768, L'\0');
     static constexpr wchar_t filter[] =
         L"Excel Workbook (*.xlsx)\0*.xlsx\0All files (*.*)\0*.*\0\0";
     OPENFILENAMEW dialog{};
     dialog.lStructSize = sizeof(dialog);
     dialog.hwndOwner = mainWindow;
     dialog.lpstrFilter = filter;
-    dialog.lpstrFile = path;
-    dialog.nMaxFile = static_cast<DWORD>(std::size(path));
+    dialog.lpstrFile = path.data();
+    dialog.nMaxFile = static_cast<DWORD>(path.size());
     dialog.lpstrTitle = L"Load symbol parameters from Excel";
     dialog.lpstrDefExt = L"xlsx";
     dialog.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST |
@@ -1467,7 +1519,7 @@ void loadExcelWorkbook() {
 
     bool expected = false;
     if (!operationRunning.compare_exchange_strong(expected, true)) return;
-    const std::wstring selectedPath(path);
+    const std::wstring selectedPath(path.data());
     const auto mappings = symbolFieldMappings;
     const HWND window = mainWindow;
     const auto state = asyncState;
@@ -1734,6 +1786,7 @@ void showApplyResult() {
     MessageBoxW(mainWindow, summary.c_str(), L"Symbol update result", MB_OK |
         ((applied.aborted || applied.failed || applied.skipped || applied.restoreFailed)
             ? MB_ICONWARNING : MB_ICONINFORMATION));
+    if (completedWithoutErrors) startFetch(true);
 }
 
 struct AbortPromptState {
@@ -2077,6 +2130,24 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         } else if (symbolList && header->hwndFrom == ListView_GetHeader(symbolList)) {
             headerView = symbolList;
         }
+        if (headerView && header->code == NM_CUSTOMDRAW) {
+            auto* draw = reinterpret_cast<NMCUSTOMDRAW*>(lParam);
+            if (draw->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+            if (draw->dwDrawStage == CDDS_ITEMPREPAINT) {
+                const std::size_t column = snapshotColumnForView(
+                    headerView, static_cast<int>(draw->dwItemSpec));
+                return isColumnDividerBefore(column) ? CDRF_NOTIFYPOSTPAINT : CDRF_DODEFAULT;
+            }
+            if (draw->dwDrawStage == CDDS_ITEMPOSTPAINT) {
+                const std::size_t column = snapshotColumnForView(
+                    headerView, static_cast<int>(draw->dwItemSpec));
+                if (isColumnDividerBefore(column)) {
+                    drawColumnDivider(draw->hdc, draw->rc.left, draw->rc.top, draw->rc.bottom);
+                }
+                return CDRF_DODEFAULT;
+            }
+            return CDRF_DODEFAULT;
+        }
         if (headerView == pinnedSymbolList && header->code == HDN_TRACKW) {
             trackPinnedColumnWidth(*reinterpret_cast<NMHEADERW*>(lParam));
             return FALSE;
@@ -2125,21 +2196,43 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             auto* draw = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
             if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
             if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYSUBITEMDRAW;
+            if (draw->nmcd.dwDrawStage == (CDDS_ITEMPOSTPAINT | CDDS_SUBITEM)) {
+                if (draw->iSubItem < 0 || draw->nmcd.dwItemSpec >= visibleRows.size()) {
+                    return CDRF_DODEFAULT;
+                }
+                const std::size_t column = snapshotColumnForView(view, draw->iSubItem);
+                if (isColumnDividerBefore(column)) {
+                    RECT cellRect{};
+                    if (ListView_GetSubItemRect(view,
+                            static_cast<int>(draw->nmcd.dwItemSpec), draw->iSubItem,
+                            LVIR_BOUNDS, &cellRect)) {
+                        drawColumnDivider(draw->nmcd.hdc, cellRect.left,
+                            cellRect.top, cellRect.bottom);
+                    }
+                }
+                return CDRF_DODEFAULT;
+            }
             if (draw->nmcd.dwDrawStage == (CDDS_ITEMPREPAINT | CDDS_SUBITEM)) {
                 // ListView can reuse the custom-draw structure for consecutive subitems.
                 // Reset colors before checking this cell so a changed cell's background
                 // cannot bleed into later, unchanged cells in the same row.
                 draw->clrText = CLR_DEFAULT;
                 draw->clrTextBk = CLR_DEFAULT;
+                if (draw->iSubItem < 0) return CDRF_DODEFAULT;
+                const std::size_t column = snapshotColumnForView(view, draw->iSubItem);
+                const bool hasDivider = isColumnDividerBefore(column);
                 if (currentSymbolColumn >= currentSnapshot.columns.size() ||
-                    draw->nmcd.dwItemSpec >= visibleRows.size() || draw->iSubItem < 0) {
-                    return CDRF_DODEFAULT;
+                    draw->nmcd.dwItemSpec >= visibleRows.size()) {
+                    return hasDivider ? CDRF_NOTIFYPOSTPAINT : CDRF_DODEFAULT;
                 }
                 const std::size_t visibleIndex = static_cast<std::size_t>(draw->nmcd.dwItemSpec);
                 const std::size_t rowIndex = visibleRows[visibleIndex];
-                if (rowIndex >= currentSnapshot.rows.size()) return CDRF_DODEFAULT;
-                const std::size_t column = snapshotColumnForView(view, draw->iSubItem);
-                if (column == (std::numeric_limits<std::size_t>::max)()) return CDRF_DODEFAULT;
+                if (rowIndex >= currentSnapshot.rows.size()) {
+                    return hasDivider ? CDRF_NOTIFYPOSTPAINT : CDRF_DODEFAULT;
+                }
+                if (column == (std::numeric_limits<std::size_t>::max)()) {
+                    return hasDivider ? CDRF_NOTIFYPOSTPAINT : CDRF_DODEFAULT;
+                }
 
                 const std::wstring_view symbol = rowCellValue(currentSnapshot.rows[rowIndex], currentSymbolColumn);
                 const auto changedSymbol = importedChangedCells.find(std::wstring(symbol));
@@ -2148,8 +2241,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     const COLORREF highlightColor = RGB(255, 255, 204);
                     draw->clrTextBk = highlightColor;
                     draw->clrText = GetSysColor(COLOR_WINDOWTEXT);
-                    return CDRF_NEWFONT;
+                    return CDRF_NEWFONT | (hasDivider ? CDRF_NOTIFYPOSTPAINT : 0);
                 }
+                return hasDivider ? CDRF_NOTIFYPOSTPAINT : CDRF_DODEFAULT;
             }
             return CDRF_DODEFAULT;
         }
@@ -2199,6 +2293,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 
     case WM_APP_FETCH_COMPLETE:
         showFetchResult();
+        closeWhenOperationFinishes();
         return 0;
 
     case WM_APP_FILTER_COLUMN:
@@ -2211,6 +2306,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 
     case WM_APP_IMPORT_COMPLETE:
         showImportLoadResult();
+        closeWhenOperationFinishes();
         return 0;
 
     case WM_APP_APPLY_PROGRESS: {
@@ -2225,13 +2321,13 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 
     case WM_APP_APPLY_COMPLETE:
         showApplyResult();
+        closeWhenOperationFinishes();
         return 0;
 
     case WM_CLOSE:
         if (operationRunning.load()) {
-            MessageBoxW(window,
-                L"A server or Excel operation is still running. Wait for it to finish before closing the application.",
-                L"MT5 Symbol Manager", MB_OK | MB_ICONINFORMATION);
+            closeAfterOperation = true;
+            setStatus(L"Closing after the current operation finishes...");
             return 0;
         }
         DestroyWindow(window);
@@ -2270,7 +2366,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
+                    _In_ LPWSTR, _In_ int showCommand) {
     HANDLE singleInstanceMutex = CreateMutexW(nullptr, TRUE, SINGLE_INSTANCE_MUTEX_NAME);
     if (!singleInstanceMutex) {
         MessageBoxW(nullptr, L"Unable to check whether MT5 Symbol Manager is already running.",

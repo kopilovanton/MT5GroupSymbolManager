@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cwchar>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -63,6 +64,19 @@ std::wstring numberText(T value) {
     }
 }
 
+std::wstring timestampText(std::int64_t timestamp) {
+    if (timestamp == 0) return L"0";
+    const __time64_t value = static_cast<__time64_t>(timestamp);
+    std::tm utc{};
+    if (_gmtime64_s(&utc, &value) != 0) return std::to_wstring(timestamp);
+
+    wchar_t buffer[40]{};
+    swprintf_s(buffer, L"%04d-%02d-%02d %02d:%02d:%02d UTC",
+        utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
+        utc.tm_hour, utc.tm_min, utc.tm_sec);
+    return buffer;
+}
+
 std::wstring colorText(COLORREF color) {
     wchar_t buffer[32]{};
     swprintf_s(buffer, L"#%02X%02X%02X (0x%08X)",
@@ -71,6 +85,8 @@ std::wstring colorText(COLORREF color) {
 }
 
 std::wstring minuteTime(std::uint32_t minutes) {
+    constexpr std::uint32_t minutesPerDay = 24 * 60;
+    minutes %= minutesPerDay;
     wchar_t buffer[16]{};
     swprintf_s(buffer, L"%02u:%02u", minutes / 60, minutes % 60);
     return buffer;
@@ -117,6 +133,75 @@ bool parseFieldNumber(std::wstring_view text, T& parsed) {
         parsed = static_cast<T>(result);
         return true;
     }
+}
+
+bool parseTimestamp(std::wstring_view text, std::int64_t& timestamp) {
+    const std::wstring value = trim(std::wstring(text));
+    if (parseFieldNumber<std::int64_t>(value, timestamp)) return true;
+
+    if (value.size() != 23 || value[4] != L'-' || value[7] != L'-' ||
+        value[10] != L' ' || value[13] != L':' || value[16] != L':' ||
+        value.substr(19) != L" UTC") {
+        return false;
+    }
+
+    const auto parseDigits = [&value](std::size_t start, std::size_t length, int& result) {
+        result = 0;
+        for (std::size_t index = start; index < start + length; ++index) {
+            if (value[index] < L'0' || value[index] > L'9') return false;
+            result = result * 10 + static_cast<int>(value[index] - L'0');
+        }
+        return true;
+    };
+
+    int year = 0, month = 0, day = 0, hour = 0, minute = 0, second = 0;
+    if (!parseDigits(0, 4, year) || !parseDigits(5, 2, month) ||
+        !parseDigits(8, 2, day) || !parseDigits(11, 2, hour) ||
+        !parseDigits(14, 2, minute) || !parseDigits(17, 2, second) ||
+        year < 1970 || month < 1 || month > 12 || day < 1 || day > 31 ||
+        hour > 23 || minute > 59 || second > 59) {
+        return false;
+    }
+
+    std::tm utc{};
+    utc.tm_year = year - 1900;
+    utc.tm_mon = month - 1;
+    utc.tm_mday = day;
+    utc.tm_hour = hour;
+    utc.tm_min = minute;
+    utc.tm_sec = second;
+    const __time64_t converted = _mkgmtime64(&utc);
+    if (converted == -1) return false;
+
+    std::tm roundTrip{};
+    if (_gmtime64_s(&roundTrip, &converted) != 0 ||
+        roundTrip.tm_year != year - 1900 || roundTrip.tm_mon != month - 1 ||
+        roundTrip.tm_mday != day || roundTrip.tm_hour != hour ||
+        roundTrip.tm_min != minute || roundTrip.tm_sec != second) {
+        return false;
+    }
+    timestamp = static_cast<std::int64_t>(converted);
+    return true;
+}
+
+template <typename Getter, typename Setter>
+bool writeTimestamp(std::wstring_view text, Getter getter, Setter setter,
+                    bool& changed, std::wstring& error) {
+    std::int64_t parsed = 0;
+    if (!parseTimestamp(text, parsed)) {
+        error = L"Invalid date/time value '" + std::wstring(text) +
+            L"'. Use YYYY-MM-DD HH:mm:ss UTC or an integer Unix timestamp.";
+        return false;
+    }
+    if (parsed == getter()) return true;
+    const MTAPIRES result = setter(parsed);
+    if (result != MT_RET_OK) {
+        error = L"SDK rejected the date/time value (MTAPIRES=" +
+            std::to_wstring(static_cast<unsigned>(result)) + L").";
+        return false;
+    }
+    changed = true;
+    return true;
 }
 
 template <typename Getter, typename Setter>
@@ -219,7 +304,7 @@ bool parseMinute(std::wstring_view text, std::uint32_t& minute) {
         text[3] < L'0' || text[3] > L'9' || text[4] < L'0' || text[4] > L'9') return false;
     const std::uint32_t hour = static_cast<std::uint32_t>((text[0] - L'0') * 10 + text[1] - L'0');
     const std::uint32_t mins = static_cast<std::uint32_t>((text[3] - L'0') * 10 + text[4] - L'0');
-    if (hour > 24 || mins > 59 || (hour == 24 && mins != 0)) return false;
+    if (hour > 48 || mins > 59 || (hour == 48 && mins != 0)) return false;
     minute = hour * 60 + mins;
     return true;
 }
@@ -229,11 +314,26 @@ using SessionRange = std::pair<std::uint32_t, std::uint32_t>;
 bool parseSessions(std::wstring_view text, std::vector<SessionRange>& ranges) {
     ranges.clear();
     const std::wstring value = trim(std::wstring(text));
-    const std::size_t colon = value.find(L':');
-    if (colon == std::wstring::npos) return false;
+    if (value.empty()) return true;
+
+    bool hasLegacyCount = false;
     std::uint32_t expectedCount = 0;
-    if (!parseFieldNumber(std::wstring_view(value).substr(0, colon), expectedCount)) return false;
-    std::size_t start = colon + 1;
+    std::size_t start = 0;
+    const std::size_t legacyColon = value.find(L':');
+    if (legacyColon != std::wstring::npos) {
+        const std::wstring prefix = trim(value.substr(0, legacyColon));
+        std::uint32_t parsedCount = 0;
+        const std::size_t afterColon = legacyColon + 1;
+        const bool legacySeparator = afterColon == value.size() ||
+            value[afterColon] == L' ' || value[afterColon] == L'\t' || value[afterColon] == L';';
+        if (legacySeparator && parseFieldNumber(prefix, parsedCount)) {
+            hasLegacyCount = true;
+            expectedCount = parsedCount;
+            start = afterColon;
+        }
+    }
+
+    constexpr std::uint32_t minutesPerDay = 24 * 60;
     while (start < value.size()) {
         while (start < value.size() && (value[start] == L' ' || value[start] == L';')) ++start;
         if (start == value.size()) break;
@@ -244,10 +344,35 @@ bool parseSessions(std::wstring_view text, std::vector<SessionRange>& ranges) {
         std::uint32_t open = 0, close = 0;
         if (!parseMinute(std::wstring_view(value).substr(start, separator - start), open) ||
             !parseMinute(std::wstring_view(value).substr(separator + 1, rangeEnd - separator - 1), close)) return false;
+
+        open %= minutesPerDay;
+        close %= minutesPerDay;
+        if (close <= open) close += minutesPerDay;
+        if (close - open > minutesPerDay) return false;
         ranges.emplace_back(open, close);
         start = rangeEnd == value.size() ? rangeEnd : rangeEnd + 1;
     }
-    return ranges.size() == expectedCount;
+    return !hasLegacyCount || ranges.size() == expectedCount;
+}
+
+bool normalizeSessionRange(SessionRange& range) {
+    constexpr std::uint32_t minutesPerDay = 24 * 60;
+    std::uint32_t open = range.first;
+    std::uint32_t close = range.second;
+    if (close <= open) close += minutesPerDay;
+    const std::uint32_t duration = close - open;
+    if (duration > minutesPerDay) return false;
+    open %= minutesPerDay;
+    range = {open, open + duration};
+    return true;
+}
+
+bool normalizeSessionRanges(std::vector<SessionRange>& ranges) {
+    for (SessionRange& range : ranges) {
+        if (!normalizeSessionRange(range)) return false;
+    }
+    std::sort(ranges.begin(), ranges.end());
+    return true;
 }
 
 template <typename Total, typename Next>
@@ -275,6 +400,14 @@ bool writeSessions(std::wstring_view text, std::uint32_t day, IMTConSymbolSessio
     std::vector<SessionRange> existing;
     if (!readSessions(day, session, totalFn, nextFn, existing)) {
         error = L"Cannot read the current symbol sessions before updating.";
+        return false;
+    }
+    if (!normalizeSessionRanges(requested)) {
+        error = L"The requested session list contains a session longer than 24 hours.";
+        return false;
+    }
+    if (!normalizeSessionRanges(existing)) {
+        error = L"The current symbol contains a session longer than 24 hours.";
         return false;
     }
     if (requested == existing) return true;
@@ -307,6 +440,127 @@ std::wstring trim(std::wstring value) {
     if (first == std::wstring::npos) return {};
     const std::size_t last = value.find_last_not_of(L" \t\r\n");
     return value.substr(first, last - first + 1);
+}
+
+constexpr std::uint64_t volumeExtScale = 100000000;
+
+std::wstring volumeText(std::uint64_t volumeExt) {
+    const std::uint64_t whole = volumeExt / volumeExtScale;
+    const std::uint64_t fraction = volumeExt % volumeExtScale;
+    if (fraction == 0) return std::to_wstring(whole);
+
+    std::wstring fractionalText = std::to_wstring(fraction);
+    fractionalText.insert(0, 8 - fractionalText.size(), L'0');
+    while (!fractionalText.empty() && fractionalText.back() == L'0') fractionalText.pop_back();
+    return std::to_wstring(whole) + L"." + fractionalText;
+}
+
+bool parseVolumeLots(std::wstring_view text, std::uint64_t& volumeExt,
+                     std::wstring& error) {
+    const std::wstring value = trim(std::wstring(text));
+    const std::size_t decimal = value.find(L'.');
+    if (value.empty() || (decimal != std::wstring::npos &&
+        value.find(L'.', decimal + 1) != std::wstring::npos)) {
+        error = L"Enter a non-negative volume in lots with up to 8 decimal places.";
+        return false;
+    }
+
+    const std::size_t integerEnd = decimal == std::wstring::npos ? value.size() : decimal;
+    const std::size_t fractionStart = decimal == std::wstring::npos ? value.size() : decimal + 1;
+    if (integerEnd == 0 && fractionStart == value.size()) {
+        error = L"Enter a non-negative volume in lots with up to 8 decimal places.";
+        return false;
+    }
+
+    const std::uint64_t maxVolumeExt = MTAPI_VOLUME_EXT_MAX;
+    const std::uint64_t maxWhole = maxVolumeExt / volumeExtScale;
+    std::uint64_t whole = 0;
+    for (std::size_t index = 0; index < integerEnd; ++index) {
+        const wchar_t ch = value[index];
+        if (ch < L'0' || ch > L'9') {
+            error = L"Enter a non-negative volume in lots with up to 8 decimal places.";
+            return false;
+        }
+        const std::uint64_t digit = static_cast<std::uint64_t>(ch - L'0');
+        if (whole > (maxWhole - digit) / 10) {
+            error = L"The volume is too large.";
+            return false;
+        }
+        whole = whole * 10 + digit;
+    }
+
+    std::uint64_t fraction = 0;
+    std::size_t fractionDigits = 0;
+    for (std::size_t index = fractionStart; index < value.size(); ++index) {
+        const wchar_t ch = value[index];
+        if (ch < L'0' || ch > L'9') {
+            error = L"Enter a non-negative volume in lots with up to 8 decimal places.";
+            return false;
+        }
+        const std::uint64_t digit = static_cast<std::uint64_t>(ch - L'0');
+        if (fractionDigits < 8) {
+            fraction = fraction * 10 + digit;
+            ++fractionDigits;
+        } else if (digit != 0) {
+            error = L"Volume precision cannot exceed 8 decimal places.";
+            return false;
+        }
+    }
+    while (fractionDigits < 8) {
+        fraction *= 10;
+        ++fractionDigits;
+    }
+
+    const std::uint64_t maxFraction = maxVolumeExt % volumeExtScale;
+    if (whole == maxWhole && fraction > maxFraction) {
+        error = L"The volume is too large.";
+        return false;
+    }
+    volumeExt = whole * volumeExtScale + fraction;
+    return true;
+}
+
+template <typename VolumeGetter, typename VolumeSetter,
+          typename VolumeExtGetter, typename VolumeExtSetter>
+bool writeVolumeLots(std::wstring_view text,
+                     VolumeGetter volumeGetter, VolumeSetter volumeSetter,
+                     VolumeExtGetter volumeExtGetter, VolumeExtSetter volumeExtSetter,
+                     bool& changed, std::wstring& error) {
+    std::uint64_t volumeExt = 0;
+    if (!parseVolumeLots(text, volumeExt, error)) return false;
+
+    const std::uint64_t volume = SMTMath::VolumeFromVolumeExt(volumeExt);
+    const std::uint64_t oldVolume = volumeGetter();
+    const std::uint64_t oldVolumeExt = volumeExtGetter();
+    if (volume == oldVolume && volumeExt == oldVolumeExt) return true;
+
+    if (volume != oldVolume) {
+        const MTAPIRES result = volumeSetter(volume);
+        if (result != MT_RET_OK) {
+            error = L"SDK rejected the volume value (MTAPIRES=" +
+                std::to_wstring(static_cast<unsigned>(result)) + L").";
+            return false;
+        }
+    }
+    if (volumeExtGetter() != volumeExt) {
+        const MTAPIRES result = volumeExtSetter(volumeExt);
+        if (result != MT_RET_OK) {
+            error = L"SDK rejected the extended volume value (MTAPIRES=" +
+                std::to_wstring(static_cast<unsigned>(result)) + L").";
+            return false;
+        }
+    }
+    if (volumeGetter() != volume || volumeExtGetter() != volumeExt) {
+        error = L"SDK did not retain the synchronized volume values.";
+        return false;
+    }
+    changed = true;
+    return true;
+}
+
+bool isHiddenVolumeExtField(std::wstring_view name) {
+    return name == L"VolumeMinExt" || name == L"VolumeMaxExt" ||
+           name == L"VolumeStepExt" || name == L"VolumeLimitExt";
 }
 
 std::wstring decodeUtf8(const std::string& bytes) {
@@ -352,8 +606,10 @@ bool writeDefaultSymbolMappings(const std::wstring& path,
 
     output << "# MT5 Symbol Manager field mappings.\n"
               "# Format: SDK field name=column heading. The line order sets the table and export order.\n"
+              "# A blank line between groups draws a vertical divider before the next column.\n"
               "# Remove a line to omit that field. Keep each source field name unchanged.\n";
     for (const Property& property : properties) {
+        if (isHiddenVolumeExtField(property.name)) continue;
         const std::string source = encodeUtf8(property.name);
         if (source.empty()) {
             error = L"Cannot encode a symbol field name in UTF-8.";
@@ -404,6 +660,23 @@ std::vector<Property> makeProperties() {
            bool& changed, std::wstring& error) { \
             return writeNumber(text, [&]() { return symbol.name(); }, \
                 [&](auto value) { return symbol.name(value); }, changed, error); \
+        }})
+#define ADD_VOLUME_FIELD(name) \
+    properties.push_back({WIDEN(STRINGIFY(name)), \
+        [](const IMTConSymbol& symbol, IMTConSymbolSession*) { \
+            const std::uint64_t volumeExt = symbol.name##Ext(); \
+            const std::uint64_t volume = volumeExt != 0 ? volumeExt : \
+                SMTMath::VolumeExtFromVolume(symbol.name()); \
+            return volumeText(volume); \
+        }, \
+        [](IMTConSymbol& symbol, std::wstring_view text, IMTConSymbolSession*, \
+           bool& changed, std::wstring& error) { \
+            return writeVolumeLots(text, \
+                [&]() { return symbol.name(); }, \
+                [&](std::uint64_t value) { return symbol.name(value); }, \
+                [&]() { return symbol.name##Ext(); }, \
+                [&](std::uint64_t value) { return symbol.name##Ext(value); }, \
+                changed, error); \
         }})
 #define ADD_TEXT_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
@@ -510,10 +783,10 @@ std::vector<Property> makeProperties() {
     ADD_FIELD(StopsLevel);
     ADD_FIELD(FreezeLevel);
     ADD_FIELD(QuotesTimeout);
-    ADD_FIELD(VolumeMin);
-    ADD_FIELD(VolumeMax);
-    ADD_FIELD(VolumeStep);
-    ADD_FIELD(VolumeLimit);
+    ADD_VOLUME_FIELD(VolumeMin);
+    ADD_VOLUME_FIELD(VolumeMax);
+    ADD_VOLUME_FIELD(VolumeStep);
+    ADD_VOLUME_FIELD(VolumeLimit);
     ADD_FIELD(MarginFlags);
     ADD_FIELD(MarginInitial);
     ADD_FIELD(MarginMaintenance);
@@ -526,8 +799,22 @@ std::vector<Property> makeProperties() {
     ADD_FIELD(SwapLong);
     ADD_FIELD(SwapShort);
     ADD_FIELD(Swap3Day);
-    ADD_FIELD(TimeStart);
-    ADD_FIELD(TimeExpiration);
+    properties.push_back({L"TimeStart",
+        [](const IMTConSymbol& symbol, IMTConSymbolSession*) {
+            return timestampText(symbol.TimeStart());
+        }, [](IMTConSymbol& symbol, std::wstring_view text, IMTConSymbolSession*,
+             bool& changed, std::wstring& error) {
+            return writeTimestamp(text, [&]() { return symbol.TimeStart(); },
+                [&](std::int64_t value) { return symbol.TimeStart(value); }, changed, error);
+        }});
+    properties.push_back({L"TimeExpiration",
+        [](const IMTConSymbol& symbol, IMTConSymbolSession*) {
+            return timestampText(symbol.TimeExpiration());
+        }, [](IMTConSymbol& symbol, std::wstring_view text, IMTConSymbolSession*,
+             bool& changed, std::wstring& error) {
+            return writeTimestamp(text, [&]() { return symbol.TimeExpiration(); },
+                [&](std::int64_t value) { return symbol.TimeExpiration(value); }, changed, error);
+        }});
     ADD_FIELD(REFlags);
     ADD_FIELD(RETimeout);
     ADD_FIELD(IECheckMode);
@@ -608,7 +895,7 @@ std::vector<Property> makeProperties() {
         const std::wstring quoteName = std::wstring(L"QuoteSessions.") + dayNames[day];
         properties.push_back({quoteName, [day](const IMTConSymbol& s, IMTConSymbolSession* session) {
             const std::uint32_t total = s.SessionQuoteTotal(day);
-            std::wstring value = std::to_wstring(total) + L": ";
+            std::wstring value;
             for (std::uint32_t pos = 0; pos < total; ++pos) {
                 const MTAPIRES result = s.SessionQuoteNext(day, pos, session);
                 if (result != MT_RET_OK) {
@@ -636,7 +923,7 @@ std::vector<Property> makeProperties() {
         const std::wstring tradeName = std::wstring(L"TradeSessions.") + dayNames[day];
         properties.push_back({tradeName, [day](const IMTConSymbol& s, IMTConSymbolSession* session) {
             const std::uint32_t total = s.SessionTradeTotal(day);
-            std::wstring value = std::to_wstring(total) + L": ";
+            std::wstring value;
             for (std::uint32_t pos = 0; pos < total; ++pos) {
                 const MTAPIRES result = s.SessionTradeNext(day, pos, session);
                 if (result != MT_RET_OK) {
@@ -663,6 +950,7 @@ std::vector<Property> makeProperties() {
     }
 
 #undef ADD_TEXT_FIELD
+#undef ADD_VOLUME_FIELD
 #undef ADD_COLOR_FIELD
 #undef ADD_READONLY_FIELD
 #undef ADD_FIELD
@@ -836,6 +1124,7 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
     }
 
     std::unordered_set<std::wstring> seenSourceNames;
+    bool dividerPending = false;
     std::size_t lineNumber = 0;
     std::size_t start = 0;
     while (start <= content.size()) {
@@ -843,7 +1132,9 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
         const std::size_t end = content.find(L'\n', start);
         const std::wstring line = trim(content.substr(start,
             end == std::wstring::npos ? std::wstring::npos : end - start));
-        if (!line.empty() && line.front() != L'#' && line.front() != L';') {
+        if (line.empty()) {
+            if (!mappings.empty()) dividerPending = true;
+        } else if (line.front() != L'#' && line.front() != L';') {
             const std::size_t equals = line.find(L'=');
             if (equals == std::wstring::npos) {
                 error = L"Expected SourceField=ColumnHeading on line " +
@@ -854,6 +1145,7 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
             SymbolFieldMapping mapping;
             mapping.sourceName = trim(line.substr(0, equals));
             mapping.displayName = trim(line.substr(equals + 1));
+            mapping.dividerBefore = !mappings.empty() && dividerPending;
             if (mapping.sourceName.empty() || mapping.displayName.empty()) {
                 error = L"Source field and column heading must not be empty on line " +
                     std::to_wstring(lineNumber) + L" in " + path;
@@ -872,6 +1164,7 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
                 return false;
             }
             mappings.push_back(std::move(mapping));
+            dividerPending = false;
         }
 
         if (end == std::wstring::npos) break;
@@ -1124,6 +1417,17 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
         bool changed = false;
         bool rowValid = true;
         std::wstring rowError;
+        std::vector<std::size_t> changedColumns;
+        changedColumns.reserve(fieldMappings.size());
+        std::vector<std::wstring> originalValues(fieldMappings.size());
+        for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
+            if (fieldMappings[column].sourceName == L"Symbol" ||
+                fieldMappings[column].sourceName == L"Path") {
+                continue;
+            }
+            originalValues[column] = properties[column].read(*symbol, session);
+        }
+
         for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
             if (fieldMappings[column].sourceName == L"Symbol") {
                 if (importedSnapshot.rows[rowIndex][column] != cleanText(symbol->Symbol())) {
@@ -1134,15 +1438,22 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
                 continue;
             }
             if (fieldMappings[column].sourceName == L"Path") continue;
+            if (!properties[column].editable || !properties[column].write) continue;
             const std::wstring& importedValue = importedSnapshot.rows[rowIndex][column];
-            if (importedValue == properties[column].read(*symbol, session)) continue;
+            if (importedValue == originalValues[column]) continue;
 
+            changedColumns.push_back(column);
+
+            bool fieldChanged = false;
             std::wstring fieldError;
-            if (!properties[column].write(*symbol, importedValue, session, changed, fieldError)) {
+            if (!properties[column].write(*symbol, importedValue, session, fieldChanged, fieldError)) {
                 rowError = L"Symbol '" + name + L"', field '" + fieldMappings[column].sourceName +
                     L"': " + fieldError;
                 rowValid = false;
                 break;
+            }
+            if (fieldChanged) {
+                changed = true;
             }
         }
         if (!rowValid) {
@@ -1157,14 +1468,45 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
 
         attempted.push_back(name);
         const MTAPIRES updateResult = admin->SymbolUpdate(symbol);
-        if (updateResult == MT_RET_OK) ++result.applied;
-        else {
+        if (updateResult != MT_RET_OK) {
             ++result.failed;
             if (result.firstFailure.empty()) {
                 result.firstFailure = L"Could not update symbol '" + name + L"': " +
                     apiError(L"SymbolUpdate", updateResult);
             }
+            continue;
         }
+
+        const MTAPIRES verifyResult = admin->SymbolGet(name.c_str(), symbol);
+        if (verifyResult != MT_RET_OK) {
+            ++result.failed;
+            if (result.firstFailure.empty()) {
+                result.firstFailure = L"Symbol '" + name +
+                    L"' was submitted, but the saved values could not be verified: " +
+                    apiError(L"SymbolGet", verifyResult);
+            }
+            continue;
+        }
+
+        bool verified = true;
+        for (const std::size_t column : changedColumns) {
+            const std::wstring actualValue = properties[column].read(*symbol, session);
+            bool wouldChange = false;
+            std::wstring verifyError;
+            if (!properties[column].write(*symbol, importedSnapshot.rows[rowIndex][column],
+                                          session, wouldChange, verifyError) || wouldChange) {
+                verified = false;
+                if (result.firstFailure.empty()) {
+                    result.firstFailure = L"Symbol '" + name + L"', field '" +
+                        fieldMappings[column].sourceName + L"' was not saved. Expected '" +
+                        importedSnapshot.rows[rowIndex][column] + L"', server returned '" +
+                        actualValue + L"'.";
+                }
+                break;
+            }
+        }
+        if (verified) ++result.applied;
+        else ++result.failed;
     }
 
     if (!result.aborted && checkpoint) {

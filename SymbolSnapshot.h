@@ -15,6 +15,7 @@ struct SymbolSnapshot {
 struct SymbolFieldMapping {
     std::wstring sourceName;
     std::wstring displayName;
+    bool dividerBefore = false;
 };
 
 enum class ApplyChoice {
