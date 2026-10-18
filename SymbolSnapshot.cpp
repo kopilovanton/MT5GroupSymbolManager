@@ -81,6 +81,7 @@ struct Property {
     std::function<std::wstring(const IMTConSymbol&, IMTConSymbolSession*)> read;
     std::function<bool(IMTConSymbol&, std::wstring_view, IMTConSymbolSession*,
                        bool&, std::wstring&)> write;
+    bool editable = true;
 };
 
 std::wstring trim(std::wstring value);
@@ -423,7 +424,7 @@ std::vector<Property> makeProperties() {
            bool&, std::wstring& error) { \
             return validateReadOnlyNumber(text, [&]() { return symbol.name(); }, \
                 WIDEN(STRINGIFY(name)), error); \
-        }})
+        }, false})
 #define ADD_COLOR_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) { return colorText(symbol.name()); }, \
@@ -440,8 +441,15 @@ std::vector<Property> makeProperties() {
             if (text == cleanText(symbol.Symbol())) return true;
             error = L"The Symbol field cannot be changed during import.";
             return false;
-        }});
-    ADD_TEXT_FIELD(Path);
+        }, false});
+    properties.push_back({L"Path",
+        [](const IMTConSymbol& symbol, IMTConSymbolSession*) { return cleanText(symbol.Path()); },
+        [](IMTConSymbol& symbol, std::wstring_view text, IMTConSymbolSession*,
+           bool&, std::wstring& error) {
+            if (text == cleanText(symbol.Path())) return true;
+            error = L"The Path field cannot be changed during import.";
+            return false;
+        }, false});
     ADD_TEXT_FIELD(ISIN);
     ADD_TEXT_FIELD(Description);
     ADD_TEXT_FIELD(International);
@@ -777,6 +785,17 @@ void releaseClones(std::unordered_map<std::wstring, IMTConSymbol*>& clones) {
 
 } // namespace
 
+bool IsSymbolFieldEditable(const std::wstring& sourceName) {
+    static const std::unordered_set<std::wstring> readOnlyFields = [] {
+        std::unordered_set<std::wstring> fields;
+        for (const Property& property : makeProperties()) {
+            if (!property.editable || !property.write) fields.insert(property.name);
+        }
+        return fields;
+    }();
+    return !readOnlyFields.contains(sourceName);
+}
+
 bool LoadSymbolFieldMappings(const std::wstring& path,
                              std::vector<SymbolFieldMapping>& mappings,
                              bool& created,
@@ -863,6 +882,16 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
         error = L"No symbol fields are configured in " + path;
         return false;
     }
+    const auto ensureProtectedField = [&mappings](const std::wstring& sourceName,
+                                                   const std::wstring& displayName) {
+        const bool present = std::any_of(mappings.begin(), mappings.end(),
+            [&sourceName](const SymbolFieldMapping& mapping) {
+                return mapping.sourceName == sourceName;
+            });
+        if (!present) mappings.push_back({sourceName, displayName});
+    };
+    ensureProtectedField(L"Symbol", L"Common.Symbol");
+    ensureProtectedField(L"Path", L"Common.Path");
     return true;
 }
 
@@ -1104,9 +1133,12 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
                 }
                 continue;
             }
+            if (fieldMappings[column].sourceName == L"Path") continue;
+            const std::wstring& importedValue = importedSnapshot.rows[rowIndex][column];
+            if (importedValue == properties[column].read(*symbol, session)) continue;
+
             std::wstring fieldError;
-            if (!properties[column].write(*symbol, importedSnapshot.rows[rowIndex][column],
-                                          session, changed, fieldError)) {
+            if (!properties[column].write(*symbol, importedValue, session, changed, fieldError)) {
                 rowError = L"Symbol '" + name + L"', field '" + fieldMappings[column].sourceName +
                     L"': " + fieldError;
                 rowValid = false;

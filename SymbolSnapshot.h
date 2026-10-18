@@ -58,6 +58,8 @@ bool LoadSymbolSnapshot(const std::wstring& server,
                         SymbolSnapshot& snapshot,
                         std::wstring& error);
 
+bool IsSymbolFieldEditable(const std::wstring& sourceName);
+
 bool ApplyImportedSymbolSnapshot(const std::wstring& server,
                                  const std::wstring& loginText,
                                  const std::wstring& password,

@@ -39,15 +39,30 @@ constexpr UINT WM_APP_APPLY_PROGRESS = WM_APP + 3;
 constexpr UINT WM_APP_APPLY_PAUSED = WM_APP + 4;
 constexpr UINT WM_APP_APPLY_COMPLETE = WM_APP + 5;
 constexpr UINT WM_APP_FILTER_COLUMN = WM_APP + 6;
+constexpr UINT WM_APP_SYNC_TABLE_SCROLL = WM_APP + 7;
+constexpr int PINNED_SYMBOL_COLUMN_WIDTH = 100;
+constexpr int PINNED_PATH_COLUMN_WIDTH = 150;
+constexpr int PINNED_SYMBOL_MIN_WIDTH = 20;
+constexpr int PINNED_PATH_MIN_WIDTH = 20;
+constexpr int TABLE_LEFT = 12;
+constexpr int TABLE_TOP_WIDE = 90;
+constexpr int TABLE_TOP_NARROW = 124;
+constexpr int STATUS_HEIGHT = 44;
+constexpr int STATUS_GAP = 6;
+constexpr int TABLE_RIGHT_MARGIN = 4;
+constexpr int TABLE_BOTTOM_MARGIN = 11;
+constexpr int NARROW_LAYOUT_WIDTH = 1150;
 constexpr wchar_t SINGLE_INSTANCE_MUTEX_NAME[] = L"Local\\MT5SymbolManager.SingleInstance";
 constexpr int IDC_PROFILE = 1001;
 constexpr int IDC_LOGIN = 1002;
 constexpr int IDC_PASSWORD = 1003;
 constexpr int IDC_CONNECT = 1004;
 constexpr int IDC_EXPORT = 1005;
-constexpr int IDC_IMPORT = 1006;
+constexpr int IDC_APPLY = 1006;
 constexpr int IDC_EXCEL_PATH = 1007;
 constexpr int IDC_BROWSE_EXCEL = 1008;
+constexpr int IDC_SHOW_CHANGED_SYMBOLS = 1009;
+constexpr int IDC_CELL_EDITOR = 1501;
 constexpr int IDC_PROFILE_PROMPT_CONNECT = 1101;
 constexpr int IDC_PROFILE_PROMPT_CANCEL = 1102;
 constexpr int IDC_PROGRESS_BAR = 1201;
@@ -111,15 +126,22 @@ struct AsyncState {
 HINSTANCE instanceHandle = nullptr;
 HWND mainWindow = nullptr;
 HWND profileCombo = nullptr;
+HWND serverLabel = nullptr;
+HWND loginLabel = nullptr;
+HWND passwordLabel = nullptr;
+HWND excelLabel = nullptr;
 HWND loginEdit = nullptr;
 HWND passwordEdit = nullptr;
 HWND connectButton = nullptr;
 HWND exportButton = nullptr;
-HWND importButton = nullptr;
+HWND applyButton = nullptr;
 HWND excelPathEdit = nullptr;
 HWND browseExcelButton = nullptr;
+HWND showChangedSymbolsCheckbox = nullptr;
+HWND cellEditor = nullptr;
 HWND statusText = nullptr;
 HWND symbolList = nullptr;
+HWND pinnedSymbolList = nullptr;
 HWND applyProgressWindow = nullptr;
 HWND applyProgressBar = nullptr;
 HWND applyProgressText = nullptr;
@@ -132,6 +154,8 @@ std::vector<SymbolFieldMapping> symbolFieldMappings;
 bool symbolFieldConfigReady = false;
 std::wstring symbolFieldConfigError;
 SymbolSnapshot currentSnapshot;
+SymbolSnapshot serverSnapshot;
+SymbolSnapshot manualEditBaseline;
 using ChangedCellMap = std::unordered_map<std::wstring, std::unordered_set<std::size_t>>;
 ChangedCellMap importedChangedCells;
 std::size_t currentSymbolColumn = (std::numeric_limits<std::size_t>::max)();
@@ -146,12 +170,17 @@ int activeSortColumn = -1;
 bool activeSortAscending = true;
 LRESULT activeProfileSelection = CB_ERR;
 bool importedDataReady = false;
+bool showChangedSymbolsOnly = false;
 bool applyFinalizing = false;
+std::size_t editingRowIndex = (std::numeric_limits<std::size_t>::max)();
+std::size_t editingColumnIndex = (std::numeric_limits<std::size_t>::max)();
+std::wstring cellEditorOriginalValue;
 std::wstring excelFilePath;
 std::wstring backupDirectoryPath;
 std::vector<std::wstring> generatedBackupPaths;
 
 void setControlTreeFont(HWND parent, HFONT font);
+void finishCellEdit(bool commit);
 
 struct ColumnFilter {
     bool active = false;
@@ -171,6 +200,134 @@ struct ColumnFilterPopupState {
 
 std::vector<ColumnFilter> columnFilters;
 std::vector<std::size_t> visibleRows;
+std::vector<std::size_t> pinnedColumnIndices;
+std::vector<std::size_t> scrollableColumnIndices;
+bool syncingTableScroll = false;
+bool syncingTableSelection = false;
+int pinnedSymbolColumnWidth = PINNED_SYMBOL_COLUMN_WIDTH;
+int pinnedPathColumnWidth = PINNED_PATH_COLUMN_WIDTH;
+void layoutTableForClient(int clientWidth, int clientHeight);
+
+const std::vector<std::size_t>& tableColumnsForView(HWND view) {
+    return view == pinnedSymbolList ? pinnedColumnIndices : scrollableColumnIndices;
+}
+
+std::size_t snapshotColumnForView(HWND view, int localColumn) {
+    const auto& columns = tableColumnsForView(view);
+    if (localColumn < 0 || static_cast<std::size_t>(localColumn) >= columns.size()) {
+        return (std::numeric_limits<std::size_t>::max)();
+    }
+    return columns[static_cast<std::size_t>(localColumn)];
+}
+
+int localColumnForSnapshot(HWND view, std::size_t snapshotColumn) {
+    const auto& columns = tableColumnsForView(view);
+    const auto found = std::find(columns.begin(), columns.end(), snapshotColumn);
+    return found == columns.end() ? -1 : static_cast<int>(found - columns.begin());
+}
+
+int pinnedColumnsWidth() {
+    int width = 0;
+    for (const std::size_t column : pinnedColumnIndices) {
+        if (column >= currentSnapshot.sourceNames.size()) continue;
+        if (currentSnapshot.sourceNames[column] == L"Symbol") {
+            width += pinnedSymbolColumnWidth;
+        } else if (currentSnapshot.sourceNames[column] == L"Path") {
+            width += pinnedPathColumnWidth;
+        }
+    }
+    return width;
+}
+
+void syncPinnedColumnWidthsFromHeader() {
+    if (!pinnedSymbolList) return;
+    HWND header = ListView_GetHeader(pinnedSymbolList);
+    if (!header) return;
+    for (int localColumn = 0; localColumn < Header_GetItemCount(header); ++localColumn) {
+        const std::size_t column = snapshotColumnForView(pinnedSymbolList, localColumn);
+        if (column >= currentSnapshot.sourceNames.size()) continue;
+        HDITEMW item{};
+        item.mask = HDI_WIDTH;
+        if (!Header_GetItem(header, localColumn, &item)) continue;
+        if (currentSnapshot.sourceNames[column] == L"Symbol") {
+            pinnedSymbolColumnWidth = (std::max)(PINNED_SYMBOL_MIN_WIDTH, item.cxy);
+        } else if (currentSnapshot.sourceNames[column] == L"Path") {
+            pinnedPathColumnWidth = (std::max)(PINNED_PATH_MIN_WIDTH, item.cxy);
+        }
+    }
+}
+
+void trackPinnedColumnWidth(NMHEADERW& notification) {
+    if (!notification.pitem || (notification.pitem->mask & HDI_WIDTH) == 0) return;
+    const std::size_t column = snapshotColumnForView(pinnedSymbolList, notification.iItem);
+    if (column >= currentSnapshot.sourceNames.size()) return;
+    int minimumWidth = 0;
+    if (currentSnapshot.sourceNames[column] == L"Symbol") {
+        minimumWidth = PINNED_SYMBOL_MIN_WIDTH;
+    } else if (currentSnapshot.sourceNames[column] == L"Path") {
+        minimumWidth = PINNED_PATH_MIN_WIDTH;
+    } else {
+        return;
+    }
+    notification.pitem->cxy = (std::max)(minimumWidth, notification.pitem->cxy);
+    if (currentSnapshot.sourceNames[column] == L"Symbol") {
+        pinnedSymbolColumnWidth = notification.pitem->cxy;
+    } else {
+        pinnedPathColumnWidth = notification.pitem->cxy;
+    }
+    RECT client{};
+    if (mainWindow && GetClientRect(mainWindow, &client)) {
+        layoutTableForClient(client.right, client.bottom);
+    }
+}
+
+void clipPinnedScrollBar() {
+    if (!pinnedSymbolList) return;
+    RECT windowRect{};
+    if (!GetWindowRect(pinnedSymbolList, &windowRect)) return;
+    const int height = windowRect.bottom - windowRect.top;
+    const int contentWidth = pinnedColumnsWidth();
+    if (contentWidth <= 0) return;
+    HRGN visibleRegion = CreateRectRgn(0, 0, contentWidth, height);
+    if (!visibleRegion) return;
+    if (!SetWindowRgn(pinnedSymbolList, visibleRegion, TRUE)) {
+        DeleteObject(visibleRegion);
+    }
+}
+
+void layoutTableForClient(int clientWidth, int clientHeight) {
+    const int tableTop = clientWidth < NARROW_LAYOUT_WIDTH
+        ? TABLE_TOP_NARROW : TABLE_TOP_WIDE;
+    const int pinnedContentWidth = pinnedColumnsWidth();
+
+    const int tableWidth = (std::max)(0,
+        clientWidth - TABLE_LEFT - TABLE_RIGHT_MARGIN);
+    const int statusY = clientHeight - STATUS_HEIGHT - TABLE_BOTTOM_MARGIN;
+    const int tableHeight = (std::max)(0,
+        statusY - STATUS_GAP - tableTop);
+    const int pinnedWindowWidth = pinnedContentWidth > 0
+        ? pinnedContentWidth + GetSystemMetrics(SM_CXVSCROLL) : 0;
+    if (pinnedSymbolList) {
+        ShowWindow(pinnedSymbolList, pinnedWindowWidth > 0 ? SW_SHOW : SW_HIDE);
+        MoveWindow(pinnedSymbolList, TABLE_LEFT, tableTop,
+            pinnedWindowWidth, tableHeight, TRUE);
+        ShowScrollBar(pinnedSymbolList, SB_VERT, FALSE);
+        clipPinnedScrollBar();
+    }
+    if (symbolList) {
+        MoveWindow(symbolList, TABLE_LEFT + pinnedContentWidth, tableTop,
+            (std::max)(0, tableWidth - pinnedContentWidth), tableHeight, TRUE);
+    }
+    if (statusText) {
+        MoveWindow(statusText, 12, statusY,
+            (std::max)(0, clientWidth - 16), STATUS_HEIGHT, TRUE);
+    }
+}
+
+HWND tableViewForSnapshotColumn(std::size_t snapshotColumn) {
+    return localColumnForSnapshot(pinnedSymbolList, snapshotColumn) >= 0
+        ? pinnedSymbolList : symbolList;
+}
 
 bool parseSortableNumber(std::wstring_view value, double& number) {
     if (value.empty()) return false;
@@ -373,6 +530,7 @@ ChangedCellMap findImportedChanges(const SymbolSnapshot& before,
         for (std::size_t importedColumn = 0; importedColumn < imported.columns.size(); ++importedColumn) {
             if (importedColumn == importedSymbolColumn) continue;
             const std::wstring_view key = snapshotColumnKey(imported, importedColumn);
+            if (key == L"Path") continue;
             const auto previousColumn = previousColumns.find(std::wstring(key));
             if (key.empty() || previousColumn == previousColumns.end()) continue;
 
@@ -384,6 +542,45 @@ ChangedCellMap findImportedChanges(const SymbolSnapshot& before,
         }
     }
     return changedCells;
+}
+
+void preserveImportedPathValues(SymbolSnapshot& imported, const SymbolSnapshot& server) {
+    if (imported.rows.empty()) return;
+    std::size_t importedSymbolColumn = (std::numeric_limits<std::size_t>::max)();
+    std::size_t importedPathColumn = (std::numeric_limits<std::size_t>::max)();
+    std::size_t serverSymbolColumn = (std::numeric_limits<std::size_t>::max)();
+    std::size_t serverPathColumn = (std::numeric_limits<std::size_t>::max)();
+    for (std::size_t column = 0; column < imported.sourceNames.size(); ++column) {
+        if (imported.sourceNames[column] == L"Symbol") importedSymbolColumn = column;
+        if (imported.sourceNames[column] == L"Path") importedPathColumn = column;
+    }
+    for (std::size_t column = 0; column < server.sourceNames.size(); ++column) {
+        if (server.sourceNames[column] == L"Symbol") serverSymbolColumn = column;
+        if (server.sourceNames[column] == L"Path") serverPathColumn = column;
+    }
+    if (importedPathColumn == (std::numeric_limits<std::size_t>::max)()) return;
+
+    if (importedSymbolColumn == (std::numeric_limits<std::size_t>::max)() ||
+        serverSymbolColumn == (std::numeric_limits<std::size_t>::max)() ||
+        serverPathColumn == (std::numeric_limits<std::size_t>::max)() || server.rows.empty()) {
+        for (auto& row : imported.rows) {
+            if (importedPathColumn < row.size()) row[importedPathColumn].clear();
+        }
+        return;
+    }
+
+    std::unordered_map<std::wstring, std::wstring_view> serverPaths;
+    serverPaths.reserve(server.rows.size());
+    for (const auto& row : server.rows) {
+        const std::wstring_view symbol = rowCellValue(row, serverSymbolColumn);
+        if (!symbol.empty()) serverPaths.emplace(std::wstring(symbol), rowCellValue(row, serverPathColumn));
+    }
+    for (auto& row : imported.rows) {
+        if (importedSymbolColumn >= row.size() || importedPathColumn >= row.size()) continue;
+        const auto path = serverPaths.find(row[importedSymbolColumn]);
+        if (path != serverPaths.end()) row[importedPathColumn] = path->second;
+        else row[importedPathColumn].clear();
+    }
 }
 
 bool containsOrdinalIgnoreCase(std::wstring_view value, std::wstring_view search) {
@@ -400,7 +597,9 @@ bool containsOrdinalIgnoreCase(std::wstring_view value, std::wstring_view search
 
 void updateFilterHeaderLabel(std::size_t column) {
     if (column >= currentSnapshot.columns.size() || column >= columnFilters.size()) return;
-    HWND header = ListView_GetHeader(symbolList);
+    HWND view = tableViewForSnapshotColumn(column);
+    const int localColumn = localColumnForSnapshot(view, column);
+    HWND header = view ? ListView_GetHeader(view) : nullptr;
     if (!header) return;
     std::wstring label = currentSnapshot.columns[column];
     if (columnFilters[column].active) label += L" *";
@@ -408,7 +607,38 @@ void updateFilterHeaderLabel(std::size_t column) {
     item.mask = HDI_TEXT;
     item.pszText = label.data();
     item.cchTextMax = static_cast<int>(label.size());
-    Header_SetItem(header, static_cast<int>(column), &item);
+    Header_SetItem(header, localColumn, &item);
+}
+
+void syncTableScroll(HWND source) {
+    if (syncingTableScroll || !pinnedSymbolList || !symbolList ||
+        (source != pinnedSymbolList && source != symbolList)) return;
+    HWND target = source == symbolList ? pinnedSymbolList : symbolList;
+    const int count = ListView_GetItemCount(source);
+    if (count <= 0) return;
+    int top = ListView_GetTopIndex(source);
+    if (top < 0) return;
+    top = (std::min)(top, count - 1);
+    const int currentTargetTop = ListView_GetTopIndex(target);
+    if (currentTargetTop == top) return;
+
+    syncingTableScroll = true;
+    ListView_EnsureVisible(target, top, FALSE);
+    const int alignedTargetTop = ListView_GetTopIndex(target);
+    if (alignedTargetTop != top) {
+        RECT itemRect{};
+        int rowHeight = 0;
+        if (ListView_GetItemRect(target, top, &itemRect, LVIR_BOUNDS)) {
+            rowHeight = itemRect.bottom - itemRect.top;
+        }
+        if (rowHeight > 0) {
+            ListView_Scroll(target, 0, (top - alignedTargetTop) * rowHeight);
+        }
+    }
+    if (target == pinnedSymbolList) {
+        ShowScrollBar(target, SB_VERT, FALSE);
+    }
+    syncingTableScroll = false;
 }
 
 void refreshVisibleRows() {
@@ -418,6 +648,11 @@ void refreshVisibleRows() {
     }
     for (std::size_t rowIndex = 0; rowIndex < currentSnapshot.rows.size(); ++rowIndex) {
         const auto& row = currentSnapshot.rows[rowIndex];
+        if (showChangedSymbolsOnly) {
+            if (currentSymbolColumn >= row.size()) continue;
+            const auto changedSymbol = importedChangedCells.find(row[currentSymbolColumn]);
+            if (changedSymbol == importedChangedCells.end() || changedSymbol->second.empty()) continue;
+        }
         bool matches = true;
         for (std::size_t column = 0; column < columnFilters.size(); ++column) {
             const ColumnFilter& filter = columnFilters[column];
@@ -430,10 +665,17 @@ void refreshVisibleRows() {
         if (matches) visibleRows.push_back(rowIndex);
     }
     if (!symbolList) return;
-    ListView_SetItemCountEx(symbolList, static_cast<int>(visibleRows.size()),
-        LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+    const int itemCount = static_cast<int>(visibleRows.size());
+    ListView_SetItemCountEx(symbolList, itemCount, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+    if (pinnedSymbolList) {
+        ListView_SetItemCountEx(pinnedSymbolList, itemCount,
+            LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+        ShowScrollBar(pinnedSymbolList, SB_VERT, FALSE);
+    }
     if (!visibleRows.empty()) {
-        ListView_RedrawItems(symbolList, 0, static_cast<int>(visibleRows.size() - 1));
+        ListView_RedrawItems(symbolList, 0, itemCount - 1);
+        if (pinnedSymbolList) ListView_RedrawItems(pinnedSymbolList, 0, itemCount - 1);
+        syncTableScroll(symbolList);
     }
 }
 
@@ -612,9 +854,11 @@ void showColumnFilter(int column) {
 
     int x = 0;
     int y = 0;
-    HWND header = ListView_GetHeader(symbolList);
+    HWND view = tableViewForSnapshotColumn(columnIndex);
+    const int localColumn = localColumnForSnapshot(view, columnIndex);
+    HWND header = view ? ListView_GetHeader(view) : nullptr;
     RECT anchor{};
-    if (header && Header_GetItemRect(header, column, &anchor)) {
+    if (header && localColumn >= 0 && Header_GetItemRect(header, localColumn, &anchor)) {
         POINT point{anchor.left, anchor.bottom};
         MapWindowPoints(header, nullptr, &point, 1);
         x = point.x;
@@ -685,23 +929,154 @@ LRESULT CALLBACK symbolListSubclassProc(HWND window, UINT message, WPARAM wParam
         if (notification && notification->hwndFrom == ListView_GetHeader(window) &&
             notification->code == HDN_DROPDOWN) {
             const auto* header = reinterpret_cast<const NMHEADERW*>(lParam);
-            PostMessageW(mainWindow, WM_APP_FILTER_COLUMN, static_cast<WPARAM>(header->iItem), 0);
+            const std::size_t column = snapshotColumnForView(window, header->iItem);
+            if (column != (std::numeric_limits<std::size_t>::max)()) {
+                PostMessageW(mainWindow, WM_APP_FILTER_COLUMN, static_cast<WPARAM>(column), 0);
+            }
             return 0;
         }
     }
-    return DefSubclassProc(window, message, wParam, lParam);
+    if (window == pinnedSymbolList && message == WM_MOUSEWHEEL && symbolList) {
+        SendMessageW(symbolList, message, wParam, lParam);
+        PostMessageW(mainWindow, WM_APP_SYNC_TABLE_SCROLL,
+            reinterpret_cast<WPARAM>(symbolList), 0);
+        return 0;
+    }
+    const LRESULT result = DefSubclassProc(window, message, wParam, lParam);
+    if (!syncingTableScroll && (window == symbolList || window == pinnedSymbolList) &&
+        (message == WM_MOUSEWHEEL || message == WM_VSCROLL || message == WM_KEYDOWN)) {
+        PostMessageW(mainWindow, WM_APP_SYNC_TABLE_SCROLL,
+            reinterpret_cast<WPARAM>(window), 0);
+    }
+    return result;
+}
+
+bool hasUncommittedCellEdit() {
+    return cellEditor && getText(cellEditor) != cellEditorOriginalValue;
+}
+
+bool hasPendingSymbolChanges() {
+    return importedDataReady || !importedChangedCells.empty() || hasUncommittedCellEdit();
 }
 
 void updateExportButton() {
     if (exportButton) {
         EnableWindow(exportButton, !operationRunning.load() && !currentSnapshot.columns.empty());
     }
-    if (importButton) {
-        EnableWindow(importButton, !operationRunning.load() && importedDataReady);
+    if (applyButton) {
+        EnableWindow(applyButton, !operationRunning.load() && hasPendingSymbolChanges());
     }
     if (browseExcelButton) {
         EnableWindow(browseExcelButton, !operationRunning.load());
     }
+    if (showChangedSymbolsCheckbox) {
+        const bool filterAvailable = importedDataReady || !importedChangedCells.empty();
+        if (!filterAvailable && showChangedSymbolsOnly) {
+            showChangedSymbolsOnly = false;
+            SendMessageW(showChangedSymbolsCheckbox, BM_SETCHECK, BST_UNCHECKED, 0);
+        }
+        ShowWindow(showChangedSymbolsCheckbox, filterAvailable ? SW_SHOW : SW_HIDE);
+        EnableWindow(showChangedSymbolsCheckbox,
+            !operationRunning.load() && filterAvailable && !importedChangedCells.empty());
+    }
+}
+
+LRESULT CALLBACK cellEditorSubclassProc(HWND window, UINT message, WPARAM wParam,
+                                        LPARAM lParam, UINT_PTR subclassId, DWORD_PTR) {
+    if (message == WM_KEYDOWN && (wParam == VK_RETURN || wParam == VK_ESCAPE)) {
+        const HWND editView = tableViewForSnapshotColumn(editingColumnIndex);
+        finishCellEdit(wParam == VK_RETURN);
+        if (editView) SetFocus(editView);
+        return 0;
+    }
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(window, cellEditorSubclassProc, subclassId);
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
+void finishCellEdit(bool commit) {
+    if (!cellEditor) return;
+
+    HWND editor = cellEditor;
+    const std::wstring value = getText(editor);
+    const std::wstring oldValue = cellEditorOriginalValue;
+    const std::size_t rowIndex = editingRowIndex;
+    const std::size_t columnIndex = editingColumnIndex;
+    cellEditor = nullptr;
+    editingRowIndex = (std::numeric_limits<std::size_t>::max)();
+    editingColumnIndex = (std::numeric_limits<std::size_t>::max)();
+    cellEditorOriginalValue.clear();
+    DestroyWindow(editor);
+
+    if (!commit || value == oldValue || rowIndex >= currentSnapshot.rows.size() ||
+        columnIndex >= currentSnapshot.rows[rowIndex].size()) {
+        updateExportButton();
+        return;
+    }
+
+    if (manualEditBaseline.rows.empty()) {
+        manualEditBaseline = serverSnapshot.rows.empty() ? currentSnapshot : serverSnapshot;
+    }
+    currentSnapshot.rows[rowIndex][columnIndex] = value;
+    importedChangedCells = findImportedChanges(manualEditBaseline, currentSnapshot);
+    refreshVisibleRows();
+    updateExportButton();
+
+    std::size_t changedCells = 0;
+    for (const auto& [symbol, columns] : importedChangedCells) {
+        (void)symbol;
+        changedCells += columns.size();
+    }
+    setStatus(L"Manual edit staged. Changed cells: " + std::to_wstring(changedCells) +
+        L". Press Apply Changes to send the values to the selected server.");
+}
+
+void beginCellEdit(int visibleIndex, int columnIndex) {
+    if (operationRunning.load() || visibleIndex < 0 || columnIndex < 0 || !symbolList) return;
+    if (cellEditor) finishCellEdit(true);
+
+    const std::size_t column = static_cast<std::size_t>(columnIndex);
+    if (column >= currentSnapshot.columns.size() ||
+        column >= currentSnapshot.sourceNames.size() ||
+        !IsSymbolFieldEditable(currentSnapshot.sourceNames[column])) return;
+
+    const std::size_t item = static_cast<std::size_t>(visibleIndex);
+    if (item >= visibleRows.size()) return;
+    const std::size_t row = visibleRows[item];
+    if (row >= currentSnapshot.rows.size() || column >= currentSnapshot.rows[row].size()) return;
+
+    if (manualEditBaseline.rows.empty()) {
+        manualEditBaseline = serverSnapshot.rows.empty() ? currentSnapshot : serverSnapshot;
+    }
+
+    HWND view = tableViewForSnapshotColumn(column);
+    const int localColumn = localColumnForSnapshot(view, column);
+    if (!view || localColumn < 0) return;
+    RECT cellRect{};
+    if (!ListView_GetSubItemRect(view, visibleIndex, localColumn, LVIR_BOUNDS, &cellRect)) return;
+    POINT corners[2]{{cellRect.left, cellRect.top}, {cellRect.right, cellRect.bottom}};
+    MapWindowPoints(view, mainWindow, corners, 2);
+    const int width = corners[1].x - corners[0].x;
+    const int height = corners[1].y - corners[0].y;
+    if (width <= 0 || height <= 0) return;
+
+    editingRowIndex = row;
+    editingColumnIndex = column;
+    cellEditorOriginalValue = currentSnapshot.rows[row][column];
+    cellEditor = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", cellEditorOriginalValue.c_str(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        corners[0].x, corners[0].y, width, height, mainWindow,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CELL_EDITOR)), instanceHandle, nullptr);
+    if (!cellEditor) {
+        editingRowIndex = (std::numeric_limits<std::size_t>::max)();
+        editingColumnIndex = (std::numeric_limits<std::size_t>::max)();
+        cellEditorOriginalValue.clear();
+        return;
+    }
+
+    SetWindowSubclass(cellEditor, cellEditorSubclassProc, 1, 0);
+    if (tableFont) SendMessageW(cellEditor, WM_SETFONT, reinterpret_cast<WPARAM>(tableFont), TRUE);
+    SetFocus(cellEditor);
+    SendMessageW(cellEditor, EM_SETSEL, 0, -1);
 }
 
 void setBusy(bool busy) {
@@ -712,10 +1087,16 @@ void setBusy(bool busy) {
     if (excelPathEdit) EnableWindow(excelPathEdit, !busy);
     updateExportButton();
     if (symbolList) EnableWindow(symbolList, !busy);
+    if (pinnedSymbolList) EnableWindow(pinnedSymbolList, !busy);
 }
 
-void clearTable() {
+void clearTable(bool preserveBaseline = false) {
+    if (cellEditor) finishCellEdit(false);
     currentSnapshot = {};
+    if (!preserveBaseline) {
+        serverSnapshot = {};
+        manualEditBaseline = {};
+    }
     importedChangedCells.clear();
     currentSymbolColumn = (std::numeric_limits<std::size_t>::max)();
     activeSortColumn = -1;
@@ -723,15 +1104,31 @@ void clearTable() {
     columnFilters.clear();
     visibleRows.clear();
     importedDataReady = false;
+    showChangedSymbolsOnly = false;
+    if (showChangedSymbolsCheckbox) {
+        SendMessageW(showChangedSymbolsCheckbox, BM_SETCHECK, BST_UNCHECKED, 0);
+    }
     excelFilePath.clear();
     if (excelPathEdit) SetWindowTextW(excelPathEdit, L"");
     updateExportButton();
     if (!symbolList) return;
     ListView_SetItemCountEx(symbolList, 0, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
-    HWND header = ListView_GetHeader(symbolList);
-    const int columns = header ? Header_GetItemCount(header) : 0;
-    for (int index = columns - 1; index >= 0; --index) {
-        ListView_DeleteColumn(symbolList, index);
+    if (pinnedSymbolList) {
+        ListView_SetItemCountEx(pinnedSymbolList, 0, LVSICF_NOINVALIDATEALL | LVSICF_NOSCROLL);
+    }
+    for (HWND view : {pinnedSymbolList, symbolList}) {
+        if (!view) continue;
+        HWND header = ListView_GetHeader(view);
+        const int columns = header ? Header_GetItemCount(header) : 0;
+        for (int index = columns - 1; index >= 0; --index) {
+            ListView_DeleteColumn(view, index);
+        }
+    }
+    pinnedColumnIndices.clear();
+    scrollableColumnIndices.clear();
+    RECT client{};
+    if (mainWindow && GetClientRect(mainWindow, &client)) {
+        layoutTableForClient(client.right, client.bottom);
     }
 }
 
@@ -750,21 +1147,71 @@ void updateCredentials() {
 
 void addTableColumns() {
     columnFilters.assign(currentSnapshot.columns.size(), ColumnFilter{});
+    pinnedColumnIndices.clear();
+    scrollableColumnIndices.clear();
+    for (const std::wstring_view pinnedName : {std::wstring_view(L"Symbol"), std::wstring_view(L"Path")}) {
+        for (std::size_t index = 0; index < currentSnapshot.sourceNames.size(); ++index) {
+            if (currentSnapshot.sourceNames[index] == pinnedName) {
+                pinnedColumnIndices.push_back(index);
+                break;
+            }
+        }
+    }
     for (std::size_t index = 0; index < currentSnapshot.columns.size(); ++index) {
-        const std::wstring& name = currentSnapshot.columns[index];
+        if (std::find(pinnedColumnIndices.begin(), pinnedColumnIndices.end(), index) == pinnedColumnIndices.end()) {
+            scrollableColumnIndices.push_back(index);
+        }
+    }
+
+    auto insertColumn = [](HWND view, std::size_t localIndex, std::size_t snapshotIndex,
+                           int width) {
+        const std::wstring& name = currentSnapshot.columns[snapshotIndex];
         LVCOLUMNW column{};
         column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
         column.pszText = const_cast<LPWSTR>(name.c_str());
-        column.iSubItem = static_cast<int>(index);
-        const int estimatedWidth = static_cast<int>(name.size() * 8 + 28);
-        column.cx = index == 0 ? 150 : std::clamp(estimatedWidth, 120, 420);
-        ListView_InsertColumn(symbolList, static_cast<int>(index), &column);
-        HWND header = ListView_GetHeader(symbolList);
+        column.iSubItem = static_cast<int>(localIndex);
+        column.cx = width;
+        ListView_InsertColumn(view, static_cast<int>(localIndex), &column);
+        HWND header = ListView_GetHeader(view);
         HDITEMW headerItem{};
         headerItem.mask = HDI_FORMAT;
-        if (header && Header_GetItem(header, static_cast<int>(index), &headerItem)) {
+        if (header && Header_GetItem(header, static_cast<int>(localIndex), &headerItem)) {
             headerItem.fmt |= HDF_SPLITBUTTON;
-            Header_SetItem(header, static_cast<int>(index), &headerItem);
+            Header_SetItem(header, static_cast<int>(localIndex), &headerItem);
+        }
+    };
+
+    for (std::size_t localIndex = 0; localIndex < pinnedColumnIndices.size(); ++localIndex) {
+        const std::size_t snapshotIndex = pinnedColumnIndices[localIndex];
+        const bool isPath = currentSnapshot.sourceNames[snapshotIndex] == L"Path";
+        const int width = isPath ? pinnedPathColumnWidth : pinnedSymbolColumnWidth;
+        insertColumn(pinnedSymbolList, localIndex, snapshotIndex, width);
+    }
+    for (std::size_t localIndex = 0; localIndex < scrollableColumnIndices.size(); ++localIndex) {
+        const std::size_t snapshotIndex = scrollableColumnIndices[localIndex];
+        insertColumn(symbolList, localIndex, snapshotIndex, 100);
+    }
+    RECT client{};
+    if (mainWindow && GetClientRect(mainWindow, &client)) {
+        layoutTableForClient(client.right, client.bottom);
+    }
+}
+
+void updateTableSortIndicators() {
+    for (HWND view : {pinnedSymbolList, symbolList}) {
+        if (!view) continue;
+        HWND header = ListView_GetHeader(view);
+        if (!header) continue;
+        const auto& columns = tableColumnsForView(view);
+        for (std::size_t local = 0; local < columns.size(); ++local) {
+            HDITEMW item{};
+            item.mask = HDI_FORMAT;
+            if (!Header_GetItem(header, static_cast<int>(local), &item)) continue;
+            item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+            if (static_cast<int>(columns[local]) == activeSortColumn) {
+                item.fmt |= activeSortAscending ? HDF_SORTUP : HDF_SORTDOWN;
+            }
+            Header_SetItem(header, static_cast<int>(local), &item);
         }
     }
 }
@@ -863,6 +1310,8 @@ void showFetchResult() {
     }
 
     currentSnapshot = std::move(result->snapshot);
+    serverSnapshot = currentSnapshot;
+    manualEditBaseline = currentSnapshot;
     importedChangedCells.clear();
     currentSymbolColumn = findSymbolColumn(currentSnapshot);
     addTableColumns();
@@ -872,7 +1321,8 @@ void showFetchResult() {
     std::wstring firstLine = L"Connected to " + result->profile + L" (" + result->server +
         L"). Retrieved parameters for " + std::to_wstring(currentSnapshot.rows.size()) + L" symbols.";
     std::wstring secondLine = L"Parameters: " + std::to_wstring(currentSnapshot.columns.size()) +
-        L". Failed symbol records: " + std::to_wstring(currentSnapshot.failedSymbols) + L".";
+        L". Double-click editable values; Failed symbol records: " +
+        std::to_wstring(currentSnapshot.failedSymbols) + L".";
     if (currentSnapshot.failedSymbols != 0) {
         secondLine += L" The failed records were skipped.";
     }
@@ -938,11 +1388,6 @@ bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
         error = L"symbols.ini must include the Symbol field before importing a workbook.";
         return false;
     }
-    if (snapshot.columns.size() != mappings.size()) {
-        error = L"The workbook columns do not match the current symbols.ini configuration.";
-        return false;
-    }
-
     std::vector<std::size_t> inputColumnForMapping(mappings.size(), mappings.size());
     std::unordered_set<std::wstring> seenHeadings;
     for (std::size_t inputColumn = 0; inputColumn < snapshot.columns.size(); ++inputColumn) {
@@ -959,7 +1404,7 @@ bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
         inputColumnForMapping[expected->second] = inputColumn;
     }
     for (std::size_t index = 0; index < inputColumnForMapping.size(); ++index) {
-        if (inputColumnForMapping[index] == mappings.size()) {
+        if (inputColumnForMapping[index] == mappings.size() && mappings[index].sourceName != L"Path") {
             error = L"The workbook is missing column '" + mappings[index].displayName + L"'.";
             return false;
         }
@@ -982,7 +1427,9 @@ bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
         }
         std::vector<std::wstring> row(mappings.size());
         for (std::size_t column = 0; column < mappings.size(); ++column) {
-            row[column] = sourceRow[inputColumnForMapping[column]];
+            if (inputColumnForMapping[column] != mappings.size()) {
+                row[column] = sourceRow[inputColumnForMapping[column]];
+            }
         }
         if (row[symbolColumn].empty()) {
             error = L"The workbook contains a row with an empty Symbol value.";
@@ -1079,11 +1526,20 @@ void showImportLoadResult() {
         return;
     }
 
-    ChangedCellMap changedCells = findImportedChanges(currentSnapshot, result->snapshot);
-    clearTable();
+    preserveImportedPathValues(result->snapshot, serverSnapshot);
+    ChangedCellMap changedCells;
+    if (!serverSnapshot.rows.empty()) {
+        changedCells = findImportedChanges(serverSnapshot, result->snapshot);
+    }
+    clearTable(true);
     currentSnapshot = std::move(result->snapshot);
+    manualEditBaseline = serverSnapshot.rows.empty() ? currentSnapshot : serverSnapshot;
     currentSymbolColumn = findSymbolColumn(currentSnapshot);
     importedChangedCells = std::move(changedCells);
+    showChangedSymbolsOnly = false;
+    if (showChangedSymbolsCheckbox) {
+        SendMessageW(showChangedSymbolsCheckbox, BM_SETCHECK, BST_UNCHECKED, 0);
+    }
     std::size_t changedCellCount = 0;
     for (const auto& [symbol, columns] : importedChangedCells) {
         (void)symbol;
@@ -1100,16 +1556,17 @@ void showImportLoadResult() {
     setStatus(L"Loaded " + std::to_wstring(currentSnapshot.rows.size()) + L" symbols and " +
         std::to_wstring(currentSnapshot.columns.size()) + L" parameters from Excel.\r\n" +
         L"Changed cells: " + std::to_wstring(changedCellCount) +
-        L" (light yellow). Import is ready to apply these values to the selected server.");
+        L" (light yellow). Press Apply Changes to send these values to the selected server.");
 }
 
 void showAbortPrompt();
 
-void startApplyImport() {
-    if (!importedDataReady || currentSnapshot.rows.empty() || operationRunning.load()) return;
+void startApplyChanges() {
+    if (cellEditor) finishCellEdit(true);
+    if (!hasPendingSymbolChanges() || currentSnapshot.rows.empty() || operationRunning.load()) return;
     ConnectionProfile profile;
     if (!selectedProfile(profile)) {
-        setStatus(L"Select a server profile before applying the imported symbol values.");
+        setStatus(L"Select a server profile before applying symbol changes.");
         return;
     }
     const std::wstring executableDirectory = GetExecutableDirectory();
@@ -1131,7 +1588,7 @@ void startApplyImport() {
         mainWindow, nullptr, instanceHandle, nullptr);
     if (!applyProgressWindow) {
         operationRunning.store(false);
-        setStatus(L"Cannot create the import progress window.");
+        setStatus(L"Cannot create the symbol update progress window.");
         return;
     }
     RECT owner{}, progress{};
@@ -1178,12 +1635,12 @@ void startApplyImport() {
                     result->result, result->error);
             } catch (const std::exception& exception) {
                 result->success = false;
-                result->error = L"Unexpected error while applying imported symbols: ";
+                result->error = L"Unexpected error while applying symbol changes: ";
                 const std::string message = exception.what();
                 result->error.append(message.begin(), message.end());
             } catch (...) {
                 result->success = false;
-                result->error = L"Unexpected error while applying imported symbols.";
+                result->error = L"Unexpected error while applying symbol changes.";
             }
             {
                 std::lock_guard lock(state->mutex);
@@ -1201,7 +1658,7 @@ void startApplyImport() {
         DestroyWindow(applyProgressWindow);
         applyProgressWindow = nullptr;
         setBusy(false);
-        setStatus(L"Cannot start the symbol import worker thread.");
+        setStatus(L"Cannot start the symbol update worker thread.");
     }
 }
 
@@ -1245,7 +1702,7 @@ void showApplyResult() {
     if (!result->result.backupPath.empty()) generatedBackupPaths.push_back(result->result.backupPath);
     if (!result->success) {
         setStatus(result->error);
-        MessageBoxW(mainWindow, result->error.c_str(), L"Excel import failed", MB_OK | MB_ICONERROR);
+        MessageBoxW(mainWindow, result->error.c_str(), L"Symbol update failed", MB_OK | MB_ICONERROR);
         return;
     }
 
@@ -1255,7 +1712,7 @@ void showApplyResult() {
         L". Failed: " + std::to_wstring(applied.failed) +
         L". Symbols not found and skipped: " + std::to_wstring(applied.skipped) +
         L". Not processed: " + std::to_wstring(applied.notProcessed) + L".";
-    if (applied.aborted) summary += L" Import was aborted.";
+    if (applied.aborted) summary += L" Update was aborted.";
     if (applied.restoreRequested) {
         summary += L" Restored: " + std::to_wstring(applied.restored) +
             L". Restore failures: " + std::to_wstring(applied.restoreFailed) + L".";
@@ -1263,7 +1720,18 @@ void showApplyResult() {
     if (!applied.firstFailure.empty()) summary += L"\r\nFirst failure: " + applied.firstFailure;
     if (!applied.backupPath.empty()) summary += L"\r\nBackup: " + applied.backupPath;
     setStatus(summary);
-    MessageBoxW(mainWindow, summary.c_str(), L"Symbol import result", MB_OK |
+    const bool completedWithoutErrors = !applied.aborted && !applied.restoreRequested &&
+        applied.failed == 0 && applied.skipped == 0 && applied.notProcessed == 0 &&
+        applied.restoreFailed == 0;
+    if (completedWithoutErrors) {
+        serverSnapshot = currentSnapshot;
+        manualEditBaseline = currentSnapshot;
+        importedChangedCells.clear();
+        importedDataReady = false;
+        refreshVisibleRows();
+        updateExportButton();
+    }
+    MessageBoxW(mainWindow, summary.c_str(), L"Symbol update result", MB_OK |
         ((applied.aborted || applied.failed || applied.skipped || applied.restoreFailed)
             ? MB_ICONWARNING : MB_ICONINFORMATION));
 }
@@ -1317,8 +1785,8 @@ LRESULT CALLBACK abortPromptProc(HWND window, UINT message, WPARAM wParam, LPARA
     switch (message) {
     case WM_CREATE: {
         CreateWindowW(L"STATIC",
-            L"The import is paused. Confirm stops after the current symbol and keeps completed changes.\n"
-            L"Confirm and Restore existing symbols reverts every change completed by this import.",
+            L"The update is paused. Confirm stops after the current symbol and keeps completed changes.\n"
+            L"Confirm and Restore existing symbols reverts every change completed by this operation.",
             WS_CHILD | WS_VISIBLE | SS_LEFT, 18, 16, 580, 52, window, nullptr, instanceHandle, nullptr);
         CreateWindowW(L"BUTTON", L"Confirm",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 260, 82, 100, 32,
@@ -1352,7 +1820,7 @@ void showAbortPrompt() {
     if (!applyProgressWindow) return;
     AbortPromptState state;
     HWND prompt = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-        ABORT_PROMPT_CLASS, L"Abort Import",
+        ABORT_PROMPT_CLASS, L"Abort Apply Changes",
         WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 620, 165,
         applyProgressWindow, nullptr, instanceHandle, &state);
     if (!prompt) {
@@ -1391,7 +1859,7 @@ void showAbortPrompt() {
     }
     if (state.choice == ApplyChoice::Continue) {
         if (!applyFinalizing) EnableWindow(applyAbortButton, TRUE);
-        SetWindowTextW(applyProgressText, L"Import resumed.");
+        SetWindowTextW(applyProgressText, L"Applying changes resumed.");
     } else if (state.choice == ApplyChoice::StopAndRestore) {
         SetWindowTextW(applyProgressText, L"Stopping and restoring existing symbols...");
     } else {
@@ -1399,14 +1867,133 @@ void showAbortPrompt() {
     }
 }
 
-void addLabel(HWND parent, const wchar_t* text, int x, int y, int width) {
+HWND addLabel(HWND parent, const wchar_t* text, int x, int y, int width) {
     HWND label = CreateWindowW(L"STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE,
                                x, y, width, 30, parent, nullptr, instanceHandle, nullptr);
     if (controlFont) SendMessageW(label, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+    return label;
+}
+
+void layoutResizableWindow(HWND window) {
+    RECT client{};
+    if (!GetClientRect(window, &client)) return;
+    const int clientWidth = static_cast<int>(client.right);
+    const int clientHeight = static_cast<int>(client.bottom);
+
+    const bool narrowLayout = clientWidth < NARROW_LAYOUT_WIDTH;
+    const int firstRowY = narrowLayout ? 10 : 14;
+    const int secondRowY = narrowLayout ? 48 : 52;
+    const int excelRowY = narrowLayout ? 86 : 52;
+
+    if (narrowLayout) {
+        const int fieldSpace = (std::max)(0, clientWidth - 231);
+        const int serverWidth = fieldSpace * 40 / 100;
+        const int loginWidth = fieldSpace * 25 / 100;
+        const int passwordWidth = fieldSpace - serverWidth - loginWidth;
+        const int serverX = 70;
+        const int loginLabelX = serverX + serverWidth + 12;
+        const int loginEditX = loginLabelX + 50;
+        const int passwordLabelX = loginEditX + loginWidth + 12;
+        const int passwordEditX = passwordLabelX + 75;
+
+        if (serverLabel) MoveWindow(serverLabel, 12, firstRowY, 58, 30, TRUE);
+        if (profileCombo) MoveWindow(profileCombo, serverX, firstRowY,
+            serverWidth, 220, TRUE);
+        if (loginLabel) MoveWindow(loginLabel, loginLabelX, firstRowY, 50, 30, TRUE);
+        if (loginEdit) MoveWindow(loginEdit, loginEditX, firstRowY,
+            loginWidth, 30, TRUE);
+        if (passwordLabel) MoveWindow(passwordLabel, passwordLabelX, firstRowY, 75, 30, TRUE);
+        if (passwordEdit) MoveWindow(passwordEdit, passwordEditX, firstRowY,
+            passwordWidth, 30, TRUE);
+
+        const int buttonGap = 8;
+        const int buttonSpace = (std::max)(0, clientWidth - 24 - 2 * buttonGap);
+        const int applyWidth = buttonSpace / 3;
+        const int exportWidth = buttonSpace / 3;
+        const int connectWidth = buttonSpace - applyWidth - exportWidth;
+        int buttonX = 12;
+        if (applyButton) MoveWindow(applyButton, buttonX, secondRowY,
+            applyWidth, 30, TRUE);
+        buttonX += applyWidth + buttonGap;
+        if (exportButton) MoveWindow(exportButton, buttonX, secondRowY,
+            exportWidth, 30, TRUE);
+        buttonX += exportWidth + buttonGap;
+        if (connectButton) MoveWindow(connectButton, buttonX, secondRowY,
+            connectWidth, 30, TRUE);
+
+        const int browseWidth = (std::clamp)(clientWidth * 14 / 100, 90, 170);
+        const int checkboxWidth = (std::clamp)(clientWidth * 18 / 100, 160, 230);
+        const int excelWidth = (std::max)(0,
+            clientWidth - 70 - 10 - browseWidth - 10 - checkboxWidth - 12);
+        const int browseX = 70 + excelWidth + 10;
+        if (excelLabel) MoveWindow(excelLabel, 12, excelRowY, 58, 30, TRUE);
+        if (excelPathEdit) MoveWindow(excelPathEdit, 70, excelRowY,
+            excelWidth, 30, TRUE);
+        if (browseExcelButton) MoveWindow(browseExcelButton, browseX, excelRowY,
+            browseWidth, 30, TRUE);
+        if (showChangedSymbolsCheckbox) {
+            MoveWindow(showChangedSymbolsCheckbox, browseX + browseWidth + 10,
+                excelRowY, checkboxWidth, 30, TRUE);
+        }
+    } else {
+        const int flexSpace = clientWidth - 289;
+        const int serverWidth = flexSpace * 300 / 1055;
+        const int loginWidth = flexSpace * 125 / 1055;
+        const int passwordWidth = flexSpace * 200 / 1055;
+        const int applyWidth = flexSpace * 140 / 1055;
+        const int exportWidth = flexSpace * 145 / 1055;
+        const int connectWidth = flexSpace - serverWidth - loginWidth -
+            passwordWidth - applyWidth - exportWidth;
+        const int loginLabelX = 70 + serverWidth + 18;
+        const int loginEditX = loginLabelX + 50;
+        const int passwordLabelX = loginEditX + loginWidth + 17;
+        const int passwordEditX = passwordLabelX + 75;
+        const int applyX = passwordEditX + passwordWidth + 20;
+        const int exportX = applyX + applyWidth + 20;
+        const int connectX = exportX + exportWidth + 15;
+
+        if (serverLabel) MoveWindow(serverLabel, 12, firstRowY, 58, 30, TRUE);
+        if (profileCombo) MoveWindow(profileCombo, 70, firstRowY,
+            serverWidth, 220, TRUE);
+        if (loginLabel) MoveWindow(loginLabel, loginLabelX, firstRowY, 50, 30, TRUE);
+        if (loginEdit) MoveWindow(loginEdit, loginEditX, firstRowY,
+            loginWidth, 30, TRUE);
+        if (passwordLabel) MoveWindow(passwordLabel, passwordLabelX, firstRowY, 75, 30, TRUE);
+        if (passwordEdit) MoveWindow(passwordEdit, passwordEditX, firstRowY,
+            passwordWidth, 30, TRUE);
+        if (applyButton) MoveWindow(applyButton, applyX, firstRowY,
+            applyWidth, 30, TRUE);
+        if (exportButton) MoveWindow(exportButton, exportX, firstRowY,
+            exportWidth, 30, TRUE);
+        if (connectButton) MoveWindow(connectButton, connectX, firstRowY,
+            connectWidth, 30, TRUE);
+
+        const int widthDelta = clientWidth - 1344;
+        const int excelWidth = 890 + widthDelta * 80 / 100;
+        const int browseWidth = 145 + widthDelta * 8 / 100;
+        const int checkboxWidth = 215 + widthDelta -
+            (excelWidth - 890) - (browseWidth - 145);
+        const int browseX = 80 + excelWidth;
+        if (excelLabel) MoveWindow(excelLabel, 12, excelRowY, 58, 30, TRUE);
+        if (excelPathEdit) MoveWindow(excelPathEdit, 70, excelRowY,
+            excelWidth, 30, TRUE);
+        if (browseExcelButton) MoveWindow(browseExcelButton, browseX, excelRowY,
+            browseWidth, 30, TRUE);
+        if (showChangedSymbolsCheckbox) {
+            MoveWindow(showChangedSymbolsCheckbox, browseX + browseWidth + 10,
+                excelRowY, checkboxWidth, 30, TRUE);
+        }
+    }
+
+    layoutTableForClient(clientWidth, clientHeight);
 }
 
 LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_SIZE:
+        if (wParam != SIZE_MINIMIZED) layoutResizableWindow(window);
+        return 0;
+
     case WM_CTLCOLORSTATIC: {
         HDC dc = reinterpret_cast<HDC>(wParam);
         HWND control = reinterpret_cast<HWND>(lParam);
@@ -1427,6 +2014,14 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     }
 
     case WM_COMMAND:
+        if (LOWORD(wParam) == IDC_CELL_EDITOR) {
+            if (HIWORD(wParam) == EN_CHANGE) {
+                updateExportButton();
+            } else if (HIWORD(wParam) == EN_KILLFOCUS) {
+                finishCellEdit(true);
+            }
+            return 0;
+        }
         if (LOWORD(wParam) == IDC_CONNECT && HIWORD(wParam) == BN_CLICKED) {
             startFetch();
             return 0;
@@ -1439,8 +2034,14 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             loadExcelWorkbook();
             return 0;
         }
-        if (LOWORD(wParam) == IDC_IMPORT && HIWORD(wParam) == BN_CLICKED) {
-            startApplyImport();
+        if (LOWORD(wParam) == IDC_SHOW_CHANGED_SYMBOLS && HIWORD(wParam) == BN_CLICKED) {
+            showChangedSymbolsOnly = SendMessageW(showChangedSymbolsCheckbox,
+                BM_GETCHECK, 0, 0) == BST_CHECKED;
+            refreshVisibleRows();
+            return 0;
+        }
+        if (LOWORD(wParam) == IDC_APPLY && HIWORD(wParam) == BN_CLICKED) {
+            startApplyChanges();
             return 0;
         }
         if (LOWORD(wParam) == IDC_PROFILE && HIWORD(wParam) == CBN_SELCHANGE) {
@@ -1458,16 +2059,68 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         break;
 
+    case WM_VSCROLL: {
+        const HWND source = reinterpret_cast<HWND>(lParam);
+        if (source == symbolList || source == pinnedSymbolList) {
+            PostMessageW(window, WM_APP_SYNC_TABLE_SCROLL,
+                reinterpret_cast<WPARAM>(source), 0);
+        }
+        break;
+    }
+
     case WM_NOTIFY: {
         const auto* header = reinterpret_cast<const NMHDR*>(lParam);
         if (!header) break;
-        const HWND listHeader = symbolList ? ListView_GetHeader(symbolList) : nullptr;
-        if (header->hwndFrom == listHeader && header->code == HDN_DROPDOWN) {
-            const auto* dropdown = reinterpret_cast<const NMHEADERW*>(lParam);
-            PostMessageW(window, WM_APP_FILTER_COLUMN, static_cast<WPARAM>(dropdown->iItem), 0);
+        HWND headerView = nullptr;
+        if (pinnedSymbolList && header->hwndFrom == ListView_GetHeader(pinnedSymbolList)) {
+            headerView = pinnedSymbolList;
+        } else if (symbolList && header->hwndFrom == ListView_GetHeader(symbolList)) {
+            headerView = symbolList;
+        }
+        if (headerView == pinnedSymbolList && header->code == HDN_TRACKW) {
+            trackPinnedColumnWidth(*reinterpret_cast<NMHEADERW*>(lParam));
+            return FALSE;
+        }
+        if (headerView == pinnedSymbolList && header->code == HDN_ENDTRACKW) {
+            syncPinnedColumnWidthsFromHeader();
+            RECT client{};
+            if (GetClientRect(window, &client)) {
+                layoutTableForClient(client.right, client.bottom);
+            }
             return 0;
         }
-        if (header->hwndFrom != symbolList) break;
+        if (headerView && header->code == HDN_DROPDOWN) {
+            const auto* dropdown = reinterpret_cast<const NMHEADERW*>(lParam);
+            const std::size_t column = snapshotColumnForView(headerView, dropdown->iItem);
+            if (column != (std::numeric_limits<std::size_t>::max)()) {
+                PostMessageW(window, WM_APP_FILTER_COLUMN, static_cast<WPARAM>(column), 0);
+            }
+            return 0;
+        }
+        const HWND view = header->hwndFrom == pinnedSymbolList ? pinnedSymbolList :
+            (header->hwndFrom == symbolList ? symbolList : nullptr);
+        if (!view) break;
+        if (header->code == LVN_ITEMCHANGED && !syncingTableSelection) {
+            const auto* change = reinterpret_cast<const NMLISTVIEW*>(lParam);
+            if ((change->uChanged & LVIF_STATE) != 0 && change->iItem >= 0) {
+                HWND other = view == symbolList ? pinnedSymbolList : symbolList;
+                if (other) {
+                    syncingTableSelection = true;
+                    ListView_SetItemState(other, change->iItem, change->uNewState,
+                        LVIS_SELECTED | LVIS_FOCUSED);
+                    syncingTableSelection = false;
+                }
+            }
+            return 0;
+        }
+        if (header->code == NM_DBLCLK) {
+            const auto* click = reinterpret_cast<const NMITEMACTIVATE*>(lParam);
+            const std::size_t column = snapshotColumnForView(view, click->iSubItem);
+            if (column != (std::numeric_limits<std::size_t>::max)()) {
+                beginCellEdit(click->iItem, static_cast<int>(column));
+            }
+            return 0;
+        }
         if (header->code == NM_CUSTOMDRAW) {
             auto* draw = reinterpret_cast<NMLVCUSTOMDRAW*>(lParam);
             if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
@@ -1485,11 +2138,13 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 const std::size_t visibleIndex = static_cast<std::size_t>(draw->nmcd.dwItemSpec);
                 const std::size_t rowIndex = visibleRows[visibleIndex];
                 if (rowIndex >= currentSnapshot.rows.size()) return CDRF_DODEFAULT;
+                const std::size_t column = snapshotColumnForView(view, draw->iSubItem);
+                if (column == (std::numeric_limits<std::size_t>::max)()) return CDRF_DODEFAULT;
 
                 const std::wstring_view symbol = rowCellValue(currentSnapshot.rows[rowIndex], currentSymbolColumn);
                 const auto changedSymbol = importedChangedCells.find(std::wstring(symbol));
                 if (changedSymbol != importedChangedCells.end() &&
-                    changedSymbol->second.contains(static_cast<std::size_t>(draw->iSubItem))) {
+                    changedSymbol->second.contains(column)) {
                     const COLORREF highlightColor = RGB(255, 255, 204);
                     draw->clrTextBk = highlightColor;
                     draw->clrText = GetSysColor(COLOR_WINDOWTEXT);
@@ -1502,11 +2157,11 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             auto* info = reinterpret_cast<NMLVDISPINFOW*>(lParam);
             if ((info->item.mask & LVIF_TEXT) != 0 && info->item.iItem >= 0 && info->item.iSubItem >= 0) {
                 const std::size_t visibleIndex = static_cast<std::size_t>(info->item.iItem);
-                const std::size_t column = static_cast<std::size_t>(info->item.iSubItem);
+                const std::size_t column = snapshotColumnForView(view, info->item.iSubItem);
                 if (visibleIndex < visibleRows.size()) {
                     const std::size_t row = visibleRows[visibleIndex];
                     if (row < currentSnapshot.rows.size() && column < currentSnapshot.rows[row].size()) {
-                    info->item.pszText = const_cast<LPWSTR>(currentSnapshot.rows[row][column].c_str());
+                        info->item.pszText = const_cast<LPWSTR>(currentSnapshot.rows[row][column].c_str());
                     }
                 }
             }
@@ -1514,39 +2169,28 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         }
         if (header->code == LVN_COLUMNCLICK) {
             const auto* click = reinterpret_cast<const NMLISTVIEW*>(lParam);
-            const int column = click->iSubItem;
-            if (column >= 0 && static_cast<std::size_t>(column) < currentSnapshot.columns.size() &&
+            const std::size_t column = snapshotColumnForView(view, click->iSubItem);
+            if (column != (std::numeric_limits<std::size_t>::max)() &&
+                column < currentSnapshot.columns.size() &&
                 !currentSnapshot.rows.empty()) {
-                if (activeSortColumn == column) {
+                if (activeSortColumn == static_cast<int>(column)) {
                     activeSortAscending = !activeSortAscending;
                 } else {
-                    activeSortColumn = column;
+                    activeSortColumn = static_cast<int>(column);
                     activeSortAscending = true;
                 }
                 std::stable_sort(currentSnapshot.rows.begin(), currentSnapshot.rows.end(),
                     [ascending = activeSortAscending, column](const auto& left, const auto& right) {
-                        const std::wstring_view leftValue = static_cast<std::size_t>(column) < left.size()
-                            ? std::wstring_view(left[static_cast<std::size_t>(column)]) : std::wstring_view{};
-                        const std::wstring_view rightValue = static_cast<std::size_t>(column) < right.size()
-                            ? std::wstring_view(right[static_cast<std::size_t>(column)]) : std::wstring_view{};
+                        const std::wstring_view leftValue = column < left.size()
+                            ? std::wstring_view(left[column]) : std::wstring_view{};
+                        const std::wstring_view rightValue = column < right.size()
+                            ? std::wstring_view(right[column]) : std::wstring_view{};
                         if (leftValue.empty() != rightValue.empty()) return !leftValue.empty();
                         const int comparison = compareCellValues(leftValue, rightValue);
                         return ascending ? comparison < 0 : comparison > 0;
                     });
                 refreshVisibleRows();
-
-                const HWND currentHeader = ListView_GetHeader(symbolList);
-                const int columnCount = Header_GetItemCount(currentHeader);
-                for (int index = 0; index < columnCount; ++index) {
-                    HDITEMW item{};
-                    item.mask = HDI_FORMAT;
-                    if (!Header_GetItem(currentHeader, index, &item)) continue;
-                    item.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
-                    if (index == activeSortColumn) {
-                        item.fmt |= activeSortAscending ? HDF_SORTUP : HDF_SORTDOWN;
-                    }
-                    Header_SetItem(currentHeader, index, &item);
-                }
+                updateTableSortIndicators();
             }
             return 0;
         }
@@ -1559,6 +2203,10 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 
     case WM_APP_FILTER_COLUMN:
         showColumnFilter(static_cast<int>(wParam));
+        return 0;
+
+    case WM_APP_SYNC_TABLE_SCROLL:
+        syncTableScroll(reinterpret_cast<HWND>(wParam));
         return 0;
 
     case WM_APP_IMPORT_COMPLETE:
@@ -1591,6 +2239,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
 
     case WM_DESTROY:
         if (symbolList) RemoveWindowSubclass(symbolList, symbolListSubclassProc, 1);
+        if (pinnedSymbolList) RemoveWindowSubclass(pinnedSymbolList, symbolListSubclassProc, 1);
         {
             std::lock_guard lock(asyncState->mutex);
             asyncState->windowAlive = false;
@@ -1699,7 +2348,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     if (!RegisterClassExW(&abortClass)) return 1;
 
     mainWindow = CreateWindowExW(0, windowClass.lpszClassName, L"MT5 Symbol Manager",
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
+            WS_MAXIMIZEBOX | WS_THICKFRAME,
         CW_USEDEFAULT, CW_USEDEFAULT, 1360, 800, nullptr, nullptr, instance, nullptr);
     if (!mainWindow) return 1;
 
@@ -1712,47 +2362,65 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     statusFont = CreateFontW(-MulDiv(13, fontDpi, 72), 0, 0, 0, FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-    tableFont = CreateFontW(-MulDiv(10, fontDpi, 72), 0, 0, 0, FW_NORMAL,
+    tableFont = CreateFontW(-MulDiv(9, fontDpi, 72), 0, 0, 0, FW_NORMAL,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 
     constexpr int top = 14;
-    addLabel(mainWindow, L"Server:", 12, top, 58);
+    serverLabel = addLabel(mainWindow, L"Server:", 12, top, 58);
     profileCombo = CreateWindowW(L"COMBOBOX", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
         70, top, 300, 220, mainWindow, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROFILE)), instance, nullptr);
-    addLabel(mainWindow, L"Login:", 388, top, 50);
+    loginLabel = addLabel(mainWindow, L"Login:", 388, top, 50);
     loginEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_READONLY | ES_AUTOHSCROLL,
         438, top, 125, 30, mainWindow, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_LOGIN)), instance, nullptr);
-    addLabel(mainWindow, L"Password:", 580, top, 75);
+    passwordLabel = addLabel(mainWindow, L"Password:", 580, top, 75);
     passwordEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_READONLY | ES_PASSWORD | ES_AUTOHSCROLL,
         655, top, 200, 30, mainWindow, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PASSWORD)), instance, nullptr);
-    importButton = CreateWindowW(L"BUTTON", L"Import", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        875, top, 140, 30, mainWindow, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_IMPORT)), instance, nullptr);
+    applyButton = CreateWindowW(L"BUTTON", L"Apply Changes", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        875, top, 140, 30, mainWindow, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_APPLY)), instance, nullptr);
     exportButton = CreateWindowW(L"BUTTON", L"Export Excel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
         1035, top, 145, 30, mainWindow, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_EXPORT)), instance, nullptr);
     connectButton = CreateWindowW(L"BUTTON", L"Connect", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
         1195, top, 145, 30, mainWindow, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CONNECT)), instance, nullptr);
-    addLabel(mainWindow, L"Excel:", 12, 52, 58);
+    excelLabel = addLabel(mainWindow, L"Excel:", 12, 52, 58);
     excelPathEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL,
-        70, 52, 1110, 30, mainWindow,
+        70, 52, 890, 30, mainWindow,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_EXCEL_PATH)), instance, nullptr);
     browseExcelButton = CreateWindowW(L"BUTTON", L"Browse...", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-        1195, 52, 145, 30, mainWindow,
+        970, 52, 145, 30, mainWindow,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_BROWSE_EXCEL)), instance, nullptr);
+    showChangedSymbolsCheckbox = CreateWindowW(L"BUTTON", L"Show changed symbols",
+        WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX,
+        1125, 52, 215, 30, mainWindow,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SHOW_CHANGED_SYMBOLS)), instance, nullptr);
     statusText = CreateWindowW(L"STATIC", L"Ready.", WS_CHILD | WS_VISIBLE | SS_LEFT,
         12, 90, 1328, 44, mainWindow, nullptr, instance, nullptr);
+    pinnedSymbolList = CreateWindowW(WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPSIBLINGS | WS_TABSTOP | LVS_REPORT | LVS_OWNERDATA |
+            LVS_SHOWSELALWAYS,
+        12, 140, PINNED_SYMBOL_COLUMN_WIDTH + PINNED_PATH_COLUMN_WIDTH + GetSystemMetrics(SM_CXVSCROLL), 610,
+        mainWindow, nullptr, instance, nullptr);
     symbolList = CreateWindowW(WC_LISTVIEWW, L"",
-        WS_CHILD | WS_VISIBLE | WS_BORDER | LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS,
-        12, 140, 1328, 610, mainWindow, nullptr, instance, nullptr);
+        WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LVS_REPORT | LVS_OWNERDATA | LVS_SHOWSELALWAYS,
+        12 + PINNED_SYMBOL_COLUMN_WIDTH + PINNED_PATH_COLUMN_WIDTH, 140,
+        1328 - PINNED_SYMBOL_COLUMN_WIDTH - PINNED_PATH_COLUMN_WIDTH, 610,
+        mainWindow, nullptr, instance, nullptr);
+    if (!pinnedSymbolList || !symbolList) return 1;
+    ShowScrollBar(pinnedSymbolList, SB_VERT, FALSE);
+    clipPinnedScrollBar();
+    ListView_SetExtendedListViewStyle(pinnedSymbolList,
+        LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
     ListView_SetExtendedListViewStyle(symbolList,
         LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    SetWindowSubclass(pinnedSymbolList, symbolListSubclassProc, 1, 0);
     SetWindowSubclass(symbolList, symbolListSubclassProc, 1, 0);
 
     setControlTreeFont(mainWindow, controlFont);
+    setControlTreeFont(pinnedSymbolList, tableFont);
     setControlTreeFont(symbolList, tableFont);
     const int scaledEditMargin = MulDiv(5, fontDpi, 96);
     const int editMargin = scaledEditMargin > 4 ? scaledEditMargin : 4;
@@ -1762,7 +2430,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         InvalidateRect(edit, nullptr, TRUE);
     }
     EnableWindow(exportButton, FALSE);
-    EnableWindow(importButton, FALSE);
+    EnableWindow(applyButton, FALSE);
     if (statusFont) SendMessageW(statusText, WM_SETFONT, reinterpret_cast<WPARAM>(statusFont), TRUE);
 
     for (std::size_t index = 0; index < profiles.size(); ++index) {
