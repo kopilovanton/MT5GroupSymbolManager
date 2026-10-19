@@ -154,6 +154,7 @@ std::vector<SymbolFieldMapping> symbolFieldMappings;
 bool symbolFieldConfigReady = false;
 std::wstring symbolFieldConfigError;
 SymbolSnapshot currentSnapshot;
+std::vector<std::vector<std::wstring>> currentDisplayRows;
 SymbolSnapshot serverSnapshot;
 SymbolSnapshot manualEditBaseline;
 using ChangedCellMap = std::unordered_map<std::wstring, std::unordered_set<std::size_t>>;
@@ -488,6 +489,25 @@ std::wstring_view rowCellValue(const std::vector<std::wstring>& row, std::size_t
     return column < row.size() ? std::wstring_view(row[column]) : std::wstring_view{};
 }
 
+void rebuildDisplayRows() {
+    currentDisplayRows = currentSnapshot.rows;
+    for (std::size_t column = 0; column < currentSnapshot.sourceNames.size(); ++column) {
+        const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
+            [sourceName = currentSnapshot.sourceNames[column]](const SymbolFieldMapping& field) {
+                return field.sourceName == sourceName;
+            });
+        if (mapping == symbolFieldMappings.end()) continue;
+        for (auto& row : currentDisplayRows) {
+            if (column < row.size()) row[column] = SymbolValueForDisplay(*mapping, row[column]);
+        }
+    }
+}
+
+std::wstring_view displayCellValue(std::size_t row, std::size_t column) {
+    if (row >= currentDisplayRows.size()) return {};
+    return rowCellValue(currentDisplayRows[row], column);
+}
+
 std::size_t findSymbolColumn(const SymbolSnapshot& snapshot) {
     for (std::size_t column = 0; column < snapshot.sourceNames.size(); ++column) {
         if (snapshot.sourceNames[column] == L"Symbol") return column;
@@ -667,6 +687,7 @@ void syncTableScroll(HWND source) {
 
 void refreshVisibleRows() {
     visibleRows.clear();
+    rebuildDisplayRows();
     if (columnFilters.size() != currentSnapshot.columns.size()) {
         columnFilters.resize(currentSnapshot.columns.size());
     }
@@ -681,7 +702,7 @@ void refreshVisibleRows() {
         for (std::size_t column = 0; column < columnFilters.size(); ++column) {
             const ColumnFilter& filter = columnFilters[column];
             if (filter.active && !filter.selectedValues.contains(
-                    std::wstring(rowCellValue(row, column)))) {
+                    std::wstring(displayCellValue(rowIndex, column)))) {
                 matches = false;
                 break;
             }
@@ -845,8 +866,8 @@ void showColumnFilter(int column) {
     ColumnFilterPopupState state;
     state.column = columnIndex;
     std::unordered_set<std::wstring> uniqueValues;
-    for (const auto& row : currentSnapshot.rows) {
-        const std::wstring value(rowCellValue(row, columnIndex));
+    for (std::size_t row = 0; row < currentSnapshot.rows.size(); ++row) {
+        const std::wstring value(displayCellValue(row, columnIndex));
         if (uniqueValues.insert(value).second) state.values.push_back(value);
     }
     std::sort(state.values.begin(), state.values.end(), [](const auto& left, const auto& right) {
@@ -1022,7 +1043,6 @@ void finishCellEdit(bool commit) {
 
     HWND editor = cellEditor;
     const std::wstring value = getText(editor);
-    const std::wstring oldValue = cellEditorOriginalValue;
     const std::size_t rowIndex = editingRowIndex;
     const std::size_t columnIndex = editingColumnIndex;
     cellEditor = nullptr;
@@ -1031,8 +1051,23 @@ void finishCellEdit(bool commit) {
     cellEditorOriginalValue.clear();
     DestroyWindow(editor);
 
-    if (!commit || value == oldValue || rowIndex >= currentSnapshot.rows.size() ||
+    if (!commit || rowIndex >= currentSnapshot.rows.size() ||
         columnIndex >= currentSnapshot.rows[rowIndex].size()) {
+        updateExportButton();
+        return;
+    }
+
+    std::wstring normalizedValue = value;
+    if (columnIndex < currentSnapshot.sourceNames.size()) {
+        const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
+            [sourceName = currentSnapshot.sourceNames[columnIndex]](const SymbolFieldMapping& field) {
+                return field.sourceName == sourceName;
+            });
+        if (mapping != symbolFieldMappings.end()) {
+            normalizedValue = SymbolValueForStorage(*mapping, normalizedValue);
+        }
+    }
+    if (normalizedValue == currentSnapshot.rows[rowIndex][columnIndex]) {
         updateExportButton();
         return;
     }
@@ -1040,7 +1075,7 @@ void finishCellEdit(bool commit) {
     if (manualEditBaseline.rows.empty()) {
         manualEditBaseline = serverSnapshot.rows.empty() ? currentSnapshot : serverSnapshot;
     }
-    currentSnapshot.rows[rowIndex][columnIndex] = value;
+    currentSnapshot.rows[rowIndex][columnIndex] = std::move(normalizedValue);
     importedChangedCells = findImportedChanges(manualEditBaseline, currentSnapshot);
     refreshVisibleRows();
     updateExportButton();
@@ -1085,7 +1120,7 @@ void beginCellEdit(int visibleIndex, int columnIndex) {
 
     editingRowIndex = row;
     editingColumnIndex = column;
-    cellEditorOriginalValue = currentSnapshot.rows[row][column];
+    cellEditorOriginalValue = std::wstring(displayCellValue(row, column));
     cellEditor = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", cellEditorOriginalValue.c_str(),
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
         corners[0].x, corners[0].y, width, height, mainWindow,
@@ -1117,6 +1152,7 @@ void setBusy(bool busy) {
 void clearTable(bool preserveBaseline = false) {
     if (cellEditor) finishCellEdit(false);
     currentSnapshot = {};
+    currentDisplayRows.clear();
     if (!preserveBaseline) {
         serverSnapshot = {};
         manualEditBaseline = {};
@@ -1394,8 +1430,19 @@ void exportSnapshot() {
 
     setStatus(L"Exporting symbol parameters to Excel...");
     UpdateWindow(statusText);
+    SymbolSnapshot exportSnapshot = currentSnapshot;
+    for (std::size_t column = 0; column < exportSnapshot.sourceNames.size(); ++column) {
+        const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
+            [sourceName = exportSnapshot.sourceNames[column]](const SymbolFieldMapping& field) {
+                return field.sourceName == sourceName;
+            });
+        if (mapping == symbolFieldMappings.end()) continue;
+        for (auto& row : exportSnapshot.rows) {
+            if (column < row.size()) row[column] = SymbolValueForDisplay(*mapping, row[column]);
+        }
+    }
     std::wstring error;
-    if (ExportSnapshotToXlsx(currentSnapshot, std::wstring(path.data()), error)) {
+    if (ExportSnapshotToXlsx(exportSnapshot, std::wstring(path.data()), error)) {
         setStatus(L"Exported " + std::to_wstring(currentSnapshot.rows.size()) +
             L" symbols and " + std::to_wstring(currentSnapshot.columns.size()) +
             L" parameters to Excel.");
@@ -1480,7 +1527,8 @@ bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
         std::vector<std::wstring> row(mappings.size());
         for (std::size_t column = 0; column < mappings.size(); ++column) {
             if (inputColumnForMapping[column] != mappings.size()) {
-                row[column] = sourceRow[inputColumnForMapping[column]];
+                row[column] = SymbolValueForStorage(mappings[column],
+                    sourceRow[inputColumnForMapping[column]]);
             }
         }
         if (row[symbolColumn].empty()) {
@@ -2254,8 +2302,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 const std::size_t column = snapshotColumnForView(view, info->item.iSubItem);
                 if (visibleIndex < visibleRows.size()) {
                     const std::size_t row = visibleRows[visibleIndex];
-                    if (row < currentSnapshot.rows.size() && column < currentSnapshot.rows[row].size()) {
-                        info->item.pszText = const_cast<LPWSTR>(currentSnapshot.rows[row][column].c_str());
+                    if (row < currentDisplayRows.size() && column < currentDisplayRows[row].size()) {
+                        info->item.pszText = const_cast<LPWSTR>(currentDisplayRows[row][column].c_str());
                     }
                 }
             }

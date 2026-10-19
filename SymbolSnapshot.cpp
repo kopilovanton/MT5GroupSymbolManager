@@ -1,4 +1,5 @@
 #include "SymbolSnapshot.h"
+#include "SymbolValueMapDefaults.h"
 
 #include <windows.h>
 #pragma warning(push)
@@ -595,6 +596,38 @@ std::string encodeUtf8(std::wstring_view text) {
     return result;
 }
 
+bool canonicalValueCode(std::wstring_view text, std::wstring& canonical) {
+    if (text.empty()) return false;
+    for (const wchar_t ch : text) {
+        if (ch < L'0' || ch > L'9') return false;
+    }
+    const std::wstring owned(text);
+    wchar_t* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::wcstoull(owned.c_str(), &end, 10);
+    if (errno == ERANGE || end != owned.c_str() + owned.size()) return false;
+    canonical = std::to_wstring(parsed);
+    return true;
+}
+
+bool parseFlagCode(std::wstring_view text, std::uint64_t& value,
+                   std::wstring* canonical = nullptr) {
+    std::wstring normalized;
+    if (!canonicalValueCode(text, normalized)) return false;
+    wchar_t* end = nullptr;
+    errno = 0;
+    const unsigned long long parsed = std::wcstoull(normalized.c_str(), &end, 10);
+    if (errno == ERANGE || end != normalized.c_str() + normalized.size()) return false;
+    value = static_cast<std::uint64_t>(parsed);
+    if (canonical) *canonical = std::move(normalized);
+    return true;
+}
+
+std::wstring serverValueForField(const SymbolFieldMapping& mapping,
+                                 const std::wstring& value) {
+    return SymbolValueForStorage(mapping, value);
+}
+
 bool writeDefaultSymbolMappings(const std::wstring& path,
                                 const std::vector<Property>& properties,
                                 std::wstring& error) {
@@ -617,6 +650,7 @@ bool writeDefaultSymbolMappings(const std::wstring& path,
         }
         output << source << '=' << source << '\n';
     }
+    output << '\n' << kDefaultSymbolValueMaps << '\n';
     output.close();
     if (!output) {
         error = L"Cannot write symbol field configuration: " + path;
@@ -1073,6 +1107,82 @@ void releaseClones(std::unordered_map<std::wstring, IMTConSymbol*>& clones) {
 
 } // namespace
 
+std::wstring SymbolValueForDisplay(const SymbolFieldMapping& mapping,
+                                   const std::wstring& value) {
+    const std::wstring cleaned = trim(value);
+    std::wstring canonical;
+    if (!mapping.valueMappings.empty() && canonicalValueCode(cleaned, canonical)) {
+        for (const auto& [code, label] : mapping.valueMappings) {
+            if (canonical == code) return label;
+        }
+        return canonical;
+    }
+
+    if (!mapping.flagMappings.empty()) {
+        std::uint64_t flags = 0;
+        if (!parseFlagCode(cleaned, flags, &canonical)) return value;
+        if (flags == 0) {
+            for (const auto& [code, label] : mapping.flagMappings) {
+                if (code == L"0") return label;
+            }
+            return canonical;
+        }
+
+        std::uint64_t remaining = flags;
+        std::wstring labels;
+        for (const auto& [code, label] : mapping.flagMappings) {
+            std::uint64_t bit = 0;
+            if (!parseFlagCode(code, bit) || bit == 0 || (remaining & bit) != bit) continue;
+            if (!labels.empty()) labels += L" | ";
+            labels += label;
+            remaining &= ~bit;
+        }
+        return remaining == 0 && !labels.empty() ? labels : canonical;
+    }
+    return value;
+}
+
+std::wstring SymbolValueForStorage(const SymbolFieldMapping& mapping,
+                                   const std::wstring& value) {
+    const std::wstring cleaned = trim(value);
+    if (!mapping.valueMappings.empty()) {
+        for (const auto& [code, label] : mapping.valueMappings) {
+            if (cleaned == label) return code;
+        }
+        std::wstring canonical;
+        if (canonicalValueCode(cleaned, canonical)) return canonical;
+        return value;
+    }
+
+    if (!mapping.flagMappings.empty()) {
+        for (const auto& [code, label] : mapping.flagMappings) {
+            if (code == L"0" && cleaned == label) return code;
+        }
+        std::uint64_t numeric = 0;
+        std::wstring canonical;
+        if (parseFlagCode(cleaned, numeric, &canonical)) return canonical;
+
+        std::uint64_t combined = 0;
+        std::size_t start = 0;
+        while (start <= cleaned.size()) {
+            const std::size_t separator = cleaned.find(L'|', start);
+            const std::wstring label = trim(cleaned.substr(start,
+                separator == std::wstring::npos ? std::wstring::npos : separator - start));
+            const auto entry = std::find_if(mapping.flagMappings.begin(), mapping.flagMappings.end(),
+                [&label](const auto& candidate) {
+                    return candidate.first != L"0" && candidate.second == label;
+                });
+            std::uint64_t bit = 0;
+            if (entry == mapping.flagMappings.end() || !parseFlagCode(entry->first, bit)) return value;
+            combined |= bit;
+            if (separator == std::wstring::npos) break;
+            start = separator + 1;
+        }
+        return std::to_wstring(combined);
+    }
+    return value;
+}
+
 bool IsSymbolFieldEditable(const std::wstring& sourceName) {
     static const std::unordered_set<std::wstring> readOnlyFields = [] {
         std::unordered_set<std::wstring> fields;
@@ -1124,6 +1234,13 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
     }
 
     std::unordered_set<std::wstring> seenSourceNames;
+    std::unordered_set<std::wstring> seenValueMapSections;
+    std::unordered_map<std::wstring,
+        std::vector<std::pair<std::wstring, std::wstring>>> parsedValueMappings;
+    std::unordered_map<std::wstring,
+        std::vector<std::pair<std::wstring, std::wstring>>> parsedFlagMappings;
+    std::wstring activeValueMapSource;
+    bool activeFlagMap = false;
     bool dividerPending = false;
     std::size_t lineNumber = 0;
     std::size_t start = 0;
@@ -1133,8 +1250,85 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
         const std::wstring line = trim(content.substr(start,
             end == std::wstring::npos ? std::wstring::npos : end - start));
         if (line.empty()) {
-            if (!mappings.empty()) dividerPending = true;
-        } else if (line.front() != L'#' && line.front() != L';') {
+            if (activeValueMapSource.empty() && !mappings.empty()) dividerPending = true;
+        } else if (line.front() == L'#' || line.front() == L';') {
+            // Comments are accepted in both the column mapping list and value map sections.
+        } else if (line.front() == L'[' && line.back() == L']') {
+            const std::wstring sectionName = trim(line.substr(1, line.size() - 2));
+            constexpr std::wstring_view valueMapPrefix = L"ValueMap.";
+            constexpr std::wstring_view flagMapPrefix = L"FlagMap.";
+            const bool isFlagMap = sectionName.rfind(flagMapPrefix, 0) == 0;
+            const std::wstring_view activePrefix = isFlagMap ? flagMapPrefix : valueMapPrefix;
+            if (sectionName.rfind(activePrefix, 0) != 0 ||
+                sectionName.size() <= activePrefix.size()) {
+                error = L"Unknown configuration section on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+
+            const std::wstring requestedField = trim(
+                sectionName.substr(activePrefix.size()));
+            std::wstring sourceName;
+            const auto knownSource = std::find_if(availableProperties.begin(), availableProperties.end(),
+                [&requestedField](const Property& property) {
+                    return property.name == requestedField;
+                });
+            if (knownSource != availableProperties.end()) {
+                sourceName = requestedField;
+            } else {
+                const auto heading = std::find_if(mappings.begin(), mappings.end(),
+                    [&requestedField](const SymbolFieldMapping& mapping) {
+                        return mapping.displayName == requestedField;
+                    });
+                if (heading != mappings.end()) sourceName = heading->sourceName;
+            }
+            if (sourceName.empty()) {
+                error = L"Unknown value-map field '" + requestedField + L"' on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            if (!seenValueMapSections.insert(sourceName).second) {
+                error = L"Duplicate value or flag map section for '" + sourceName + L"' in " + path;
+                return false;
+            }
+            activeValueMapSource = std::move(sourceName);
+            activeFlagMap = isFlagMap;
+        } else if (!activeValueMapSource.empty()) {
+            const std::size_t equals = line.find(L'=');
+            if (equals == std::wstring::npos) {
+                error = L"Expected numeric code=display label on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            std::wstring code;
+            const std::wstring codeText = trim(line.substr(0, equals));
+            const std::wstring label = trim(line.substr(equals + 1));
+            if (!canonicalValueCode(codeText, code) || label.empty()) {
+                error = L"Value and flag map entries require a non-negative integer code and non-empty label on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            std::uint64_t flagValue = 0;
+            if (activeFlagMap &&
+                (!parseFlagCode(code, flagValue) ||
+                 (flagValue != 0 && (flagValue & (flagValue - 1)) != 0))) {
+                error = L"Flag-map codes must be zero or a single bit value on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            auto& entries = activeFlagMap ? parsedFlagMappings[activeValueMapSource]
+                                          : parsedValueMappings[activeValueMapSource];
+            const bool duplicateCode = std::any_of(entries.begin(), entries.end(),
+                [&code](const auto& entry) { return entry.first == code; });
+            const bool duplicateLabel = std::any_of(entries.begin(), entries.end(),
+                [&label](const auto& entry) { return entry.second == label; });
+            if (duplicateCode || duplicateLabel) {
+                error = L"Duplicate code or label in map section for '" +
+                    activeValueMapSource + L"' on line " + std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            entries.emplace_back(std::move(code), label);
+        } else {
             const std::size_t equals = line.find(L'=');
             if (equals == std::wstring::npos) {
                 error = L"Expected SourceField=ColumnHeading on line " +
@@ -1185,6 +1379,16 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
     };
     ensureProtectedField(L"Symbol", L"Common.Symbol");
     ensureProtectedField(L"Path", L"Common.Path");
+    for (SymbolFieldMapping& mapping : mappings) {
+        const auto valueMap = parsedValueMappings.find(mapping.sourceName);
+        if (valueMap != parsedValueMappings.end()) {
+            mapping.valueMappings = valueMap->second;
+        }
+        const auto flagMap = parsedFlagMappings.find(mapping.sourceName);
+        if (flagMap != parsedFlagMappings.end()) {
+            mapping.flagMappings = flagMap->second;
+        }
+    }
     return true;
 }
 
@@ -1240,8 +1444,8 @@ bool LoadSymbolSnapshot(const std::wstring& server,
 
         std::vector<std::wstring> row;
         row.reserve(properties.size());
-        for (const Property& property : properties) {
-            row.push_back(property.read(*symbol, session));
+        for (std::size_t column = 0; column < properties.size(); ++column) {
+            row.push_back(properties[column].read(*symbol, session));
         }
         snapshot.rows.push_back(std::move(row));
     }
@@ -1446,7 +1650,8 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
 
             bool fieldChanged = false;
             std::wstring fieldError;
-            if (!properties[column].write(*symbol, importedValue, session, fieldChanged, fieldError)) {
+            const std::wstring serverValue = serverValueForField(fieldMappings[column], importedValue);
+            if (!properties[column].write(*symbol, serverValue, session, fieldChanged, fieldError)) {
                 rowError = L"Symbol '" + name + L"', field '" + fieldMappings[column].sourceName +
                     L"': " + fieldError;
                 rowValid = false;
@@ -1490,16 +1695,20 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
 
         bool verified = true;
         for (const std::size_t column : changedColumns) {
-            const std::wstring actualValue = properties[column].read(*symbol, session);
+            const std::wstring rawActualValue = properties[column].read(*symbol, session);
+            const std::wstring actualValue = SymbolValueForDisplay(fieldMappings[column], rawActualValue);
+            const std::wstring serverValue = serverValueForField(
+                fieldMappings[column], importedSnapshot.rows[rowIndex][column]);
             bool wouldChange = false;
             std::wstring verifyError;
-            if (!properties[column].write(*symbol, importedSnapshot.rows[rowIndex][column],
+            if (!properties[column].write(*symbol, serverValue,
                                           session, wouldChange, verifyError) || wouldChange) {
                 verified = false;
                 if (result.firstFailure.empty()) {
                     result.firstFailure = L"Symbol '" + name + L"', field '" +
                         fieldMappings[column].sourceName + L"' was not saved. Expected '" +
-                        importedSnapshot.rows[rowIndex][column] + L"', server returned '" +
+                        SymbolValueForDisplay(fieldMappings[column], serverValue) +
+                        L"', server returned '" +
                         actualValue + L"'.";
                 }
                 break;

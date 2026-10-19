@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct SymbolSnapshot {
@@ -16,6 +17,10 @@ struct SymbolFieldMapping {
     std::wstring sourceName;
     std::wstring displayName;
     bool dividerBefore = false;
+    // Optional SDK value-code to user-facing label mappings for enum-like fields.
+    std::vector<std::pair<std::wstring, std::wstring>> valueMappings;
+    // Optional bit value to label mappings for SDK flag fields.
+    std::vector<std::pair<std::wstring, std::wstring>> flagMappings;
 };
 
 enum class ApplyChoice {
@@ -51,6 +56,11 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
                              std::vector<SymbolFieldMapping>& mappings,
                              bool& created,
                              std::wstring& error);
+
+std::wstring SymbolValueForDisplay(const SymbolFieldMapping& mapping,
+                                   const std::wstring& value);
+std::wstring SymbolValueForStorage(const SymbolFieldMapping& mapping,
+                                   const std::wstring& value);
 
 bool LoadSymbolSnapshot(const std::wstring& server,
                         const std::wstring& loginText,

@@ -69,6 +69,7 @@
   <ItemGroup>
     <ClInclude Include="Connections.h" />
     <ClInclude Include="SymbolSnapshot.h" />
+    <ClInclude Include="SymbolValueMapDefaults.h" />
     <ClInclude Include="ExcelExport.h" />
     <ClInclude Include="ExcelImport.h" />
     <ClInclude Include="resource.h" />
