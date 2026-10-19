@@ -459,65 +459,128 @@ std::wstring volumeText(std::uint64_t volumeExt) {
 bool parseVolumeLots(std::wstring_view text, std::uint64_t& volumeExt,
                      std::wstring& error) {
     const std::wstring value = trim(std::wstring(text));
-    const std::size_t decimal = value.find(L'.');
-    if (value.empty() || (decimal != std::wstring::npos &&
-        value.find(L'.', decimal + 1) != std::wstring::npos)) {
+    constexpr std::uint64_t maxVolumeExt = MTAPI_VOLUME_EXT_MAX;
+    constexpr std::int64_t maxExponent = 10000;
+    const auto invalidValue = [&error]() {
         error = L"Enter a non-negative volume in lots with up to 8 decimal places.";
+    };
+    if (value.empty() || value.size() > 256) {
+        invalidValue();
         return false;
     }
 
-    const std::size_t integerEnd = decimal == std::wstring::npos ? value.size() : decimal;
-    const std::size_t fractionStart = decimal == std::wstring::npos ? value.size() : decimal + 1;
-    if (integerEnd == 0 && fractionStart == value.size()) {
-        error = L"Enter a non-negative volume in lots with up to 8 decimal places.";
+    const std::size_t exponentPosition = value.find_first_of(L"eE");
+    if (exponentPosition != std::wstring::npos &&
+        value.find_first_of(L"eE", exponentPosition + 1) != std::wstring::npos) {
+        invalidValue();
         return false;
     }
 
-    const std::uint64_t maxVolumeExt = MTAPI_VOLUME_EXT_MAX;
-    const std::uint64_t maxWhole = maxVolumeExt / volumeExtScale;
-    std::uint64_t whole = 0;
-    for (std::size_t index = 0; index < integerEnd; ++index) {
+    const std::size_t mantissaEnd = exponentPosition == std::wstring::npos
+        ? value.size() : exponentPosition;
+    std::wstring digits;
+    digits.reserve(mantissaEnd);
+    std::size_t digitsBeforeDecimal = 0;
+    bool decimalSeen = false;
+    bool digitSeen = false;
+    for (std::size_t index = 0; index < mantissaEnd; ++index) {
         const wchar_t ch = value[index];
+        if (ch == L'.') {
+            if (decimalSeen) {
+                invalidValue();
+                return false;
+            }
+            decimalSeen = true;
+            continue;
+        }
         if (ch < L'0' || ch > L'9') {
-            error = L"Enter a non-negative volume in lots with up to 8 decimal places.";
+            invalidValue();
             return false;
         }
-        const std::uint64_t digit = static_cast<std::uint64_t>(ch - L'0');
-        if (whole > (maxWhole - digit) / 10) {
-            error = L"The volume is too large.";
-            return false;
-        }
-        whole = whole * 10 + digit;
+        digitSeen = true;
+        digits.push_back(ch);
+        if (!decimalSeen) ++digitsBeforeDecimal;
+    }
+    if (!digitSeen) {
+        invalidValue();
+        return false;
     }
 
-    std::uint64_t fraction = 0;
-    std::size_t fractionDigits = 0;
-    for (std::size_t index = fractionStart; index < value.size(); ++index) {
-        const wchar_t ch = value[index];
-        if (ch < L'0' || ch > L'9') {
-            error = L"Enter a non-negative volume in lots with up to 8 decimal places.";
+    std::int64_t exponent = 0;
+    if (exponentPosition != std::wstring::npos) {
+        std::size_t index = exponentPosition + 1;
+        bool negativeExponent = false;
+        if (index < value.size() && (value[index] == L'+' || value[index] == L'-')) {
+            negativeExponent = value[index] == L'-';
+            ++index;
+        }
+        if (index == value.size()) {
+            invalidValue();
             return false;
         }
-        const std::uint64_t digit = static_cast<std::uint64_t>(ch - L'0');
-        if (fractionDigits < 8) {
-            fraction = fraction * 10 + digit;
-            ++fractionDigits;
-        } else if (digit != 0) {
+        std::int64_t magnitude = 0;
+        for (; index < value.size(); ++index) {
+            const wchar_t ch = value[index];
+            if (ch < L'0' || ch > L'9') {
+                invalidValue();
+                return false;
+            }
+            const std::int64_t digit = ch - L'0';
+            if (magnitude > (maxExponent - digit) / 10) {
+                error = negativeExponent
+                    ? L"Volume precision cannot exceed 8 decimal places."
+                    : L"The volume is too large.";
+                return false;
+            }
+            magnitude = magnitude * 10 + digit;
+        }
+        exponent = negativeExponent ? -magnitude : magnitude;
+    }
+
+    const std::size_t firstNonZero = digits.find_first_not_of(L'0');
+    if (firstNonZero == std::wstring::npos) {
+        volumeExt = 0;
+        return true;
+    }
+
+    const std::int64_t scaledDigits = static_cast<std::int64_t>(digitsBeforeDecimal) +
+        exponent + 8 - static_cast<std::int64_t>(firstNonZero);
+    if (scaledDigits <= 0) {
+        error = L"Volume precision cannot exceed 8 decimal places.";
+        return false;
+    }
+
+    const std::size_t significantDigits = digits.size() - firstNonZero;
+    const std::size_t integerDigits = static_cast<std::size_t>(scaledDigits);
+    if (integerDigits < significantDigits) {
+        const auto discardedStart = digits.begin() +
+            static_cast<std::ptrdiff_t>(firstNonZero + integerDigits);
+        if (std::any_of(discardedStart, digits.end(), [](wchar_t ch) { return ch != L'0'; })) {
             error = L"Volume precision cannot exceed 8 decimal places.";
             return false;
         }
     }
-    while (fractionDigits < 8) {
-        fraction *= 10;
-        ++fractionDigits;
+
+    std::uint64_t scaledVolume = 0;
+    const std::size_t mantissaDigits = integerDigits < significantDigits
+        ? integerDigits : significantDigits;
+    for (std::size_t index = 0; index < mantissaDigits; ++index) {
+        const std::uint64_t digit = static_cast<std::uint64_t>(digits[firstNonZero + index] - L'0');
+        if (scaledVolume > (maxVolumeExt - digit) / 10) {
+            error = L"The volume is too large.";
+            return false;
+        }
+        scaledVolume = scaledVolume * 10 + digit;
+    }
+    for (std::size_t index = mantissaDigits; index < integerDigits; ++index) {
+        if (scaledVolume > maxVolumeExt / 10) {
+            error = L"The volume is too large.";
+            return false;
+        }
+        scaledVolume *= 10;
     }
 
-    const std::uint64_t maxFraction = maxVolumeExt % volumeExtScale;
-    if (whole == maxWhole && fraction > maxFraction) {
-        error = L"The volume is too large.";
-        return false;
-    }
-    volumeExt = whole * volumeExtScale + fraction;
+    volumeExt = scaledVolume;
     return true;
 }
 
@@ -608,6 +671,24 @@ bool canonicalValueCode(std::wstring_view text, std::wstring& canonical) {
     if (errno == ERANGE || end != owned.c_str() + owned.size()) return false;
     canonical = std::to_wstring(parsed);
     return true;
+}
+
+bool canonicalAlpha3Code(std::wstring_view text, std::wstring& canonical) {
+    if (text.size() != 3) return false;
+    canonical.clear();
+    canonical.reserve(3);
+    for (const wchar_t ch : text) {
+        if (ch >= L'a' && ch <= L'z') canonical.push_back(ch - (L'a' - L'A'));
+        else if (ch >= L'A' && ch <= L'Z') canonical.push_back(ch);
+        else return false;
+    }
+    return true;
+}
+
+bool equalsIgnoreCase(std::wstring_view left, std::wstring_view right) {
+    return left.size() == right.size() &&
+        CompareStringOrdinal(left.data(), static_cast<int>(left.size()),
+                             right.data(), static_cast<int>(right.size()), TRUE) == CSTR_EQUAL;
 }
 
 bool parseFlagCode(std::wstring_view text, std::uint64_t& value,
@@ -1110,6 +1191,15 @@ void releaseClones(std::unordered_map<std::wstring, IMTConSymbol*>& clones) {
 std::wstring SymbolValueForDisplay(const SymbolFieldMapping& mapping,
                                    const std::wstring& value) {
     const std::wstring cleaned = trim(value);
+    if (!mapping.textMappings.empty()) {
+        std::wstring canonical;
+        if (!canonicalAlpha3Code(cleaned, canonical)) return value;
+        for (const auto& [code, label] : mapping.textMappings) {
+            if (canonical == code) return label;
+        }
+        return value;
+    }
+
     std::wstring canonical;
     if (!mapping.valueMappings.empty() && canonicalValueCode(cleaned, canonical)) {
         for (const auto& [code, label] : mapping.valueMappings) {
@@ -1121,10 +1211,10 @@ std::wstring SymbolValueForDisplay(const SymbolFieldMapping& mapping,
     if (!mapping.flagMappings.empty()) {
         std::uint64_t flags = 0;
         if (!parseFlagCode(cleaned, flags, &canonical)) return value;
+        for (const auto& [code, label] : mapping.flagMappings) {
+            if (code == canonical) return label;
+        }
         if (flags == 0) {
-            for (const auto& [code, label] : mapping.flagMappings) {
-                if (code == L"0") return label;
-            }
             return canonical;
         }
 
@@ -1132,7 +1222,8 @@ std::wstring SymbolValueForDisplay(const SymbolFieldMapping& mapping,
         std::wstring labels;
         for (const auto& [code, label] : mapping.flagMappings) {
             std::uint64_t bit = 0;
-            if (!parseFlagCode(code, bit) || bit == 0 || (remaining & bit) != bit) continue;
+            if (!parseFlagCode(code, bit) || bit == 0 || (bit & (bit - 1)) != 0 ||
+                label.find(L'|') != std::wstring::npos || (remaining & bit) != bit) continue;
             if (!labels.empty()) labels += L" | ";
             labels += label;
             remaining &= ~bit;
@@ -1145,6 +1236,20 @@ std::wstring SymbolValueForDisplay(const SymbolFieldMapping& mapping,
 std::wstring SymbolValueForStorage(const SymbolFieldMapping& mapping,
                                    const std::wstring& value) {
     const std::wstring cleaned = trim(value);
+    if (!mapping.textMappings.empty()) {
+        for (const auto& [code, label] : mapping.textMappings) {
+            if (equalsIgnoreCase(cleaned, label)) return code;
+        }
+        std::wstring canonical;
+        if (canonicalAlpha3Code(cleaned, canonical)) {
+            for (const auto& [code, label] : mapping.textMappings) {
+                (void)label;
+                if (canonical == code) return canonical;
+            }
+        }
+        return value;
+    }
+
     if (!mapping.valueMappings.empty()) {
         for (const auto& [code, label] : mapping.valueMappings) {
             if (cleaned == label) return code;
@@ -1156,7 +1261,7 @@ std::wstring SymbolValueForStorage(const SymbolFieldMapping& mapping,
 
     if (!mapping.flagMappings.empty()) {
         for (const auto& [code, label] : mapping.flagMappings) {
-            if (code == L"0" && cleaned == label) return code;
+            if (equalsIgnoreCase(cleaned, label)) return code;
         }
         std::uint64_t numeric = 0;
         std::wstring canonical;
@@ -1170,7 +1275,10 @@ std::wstring SymbolValueForStorage(const SymbolFieldMapping& mapping,
                 separator == std::wstring::npos ? std::wstring::npos : separator - start));
             const auto entry = std::find_if(mapping.flagMappings.begin(), mapping.flagMappings.end(),
                 [&label](const auto& candidate) {
-                    return candidate.first != L"0" && candidate.second == label;
+                    std::uint64_t code = 0;
+                    return candidate.second == label && parseFlagCode(candidate.first, code) &&
+                        code != 0 && (code & (code - 1)) == 0 &&
+                        candidate.second.find(L'|') == std::wstring::npos;
                 });
             std::uint64_t bit = 0;
             if (entry == mapping.flagMappings.end() || !parseFlagCode(entry->first, bit)) return value;
@@ -1234,13 +1342,16 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
     }
 
     std::unordered_set<std::wstring> seenSourceNames;
-    std::unordered_set<std::wstring> seenValueMapSections;
+    std::unordered_set<std::wstring> seenMapSections;
     std::unordered_map<std::wstring,
         std::vector<std::pair<std::wstring, std::wstring>>> parsedValueMappings;
     std::unordered_map<std::wstring,
         std::vector<std::pair<std::wstring, std::wstring>>> parsedFlagMappings;
-    std::wstring activeValueMapSource;
-    bool activeFlagMap = false;
+    std::unordered_map<std::wstring,
+        std::vector<std::pair<std::wstring, std::wstring>>> parsedTextMappings;
+    enum class MappingKind { None, Value, Flag, Text };
+    std::wstring activeMapSource;
+    MappingKind activeMapKind = MappingKind::None;
     bool dividerPending = false;
     std::size_t lineNumber = 0;
     std::size_t start = 0;
@@ -1250,17 +1361,29 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
         const std::wstring line = trim(content.substr(start,
             end == std::wstring::npos ? std::wstring::npos : end - start));
         if (line.empty()) {
-            if (activeValueMapSource.empty() && !mappings.empty()) dividerPending = true;
+            if (activeMapKind == MappingKind::None && !mappings.empty()) dividerPending = true;
         } else if (line.front() == L'#' || line.front() == L';') {
-            // Comments are accepted in both the column mapping list and value map sections.
+            // Comments are accepted in both the column mapping list and map sections.
         } else if (line.front() == L'[' && line.back() == L']') {
             const std::wstring sectionName = trim(line.substr(1, line.size() - 2));
             constexpr std::wstring_view valueMapPrefix = L"ValueMap.";
             constexpr std::wstring_view flagMapPrefix = L"FlagMap.";
-            const bool isFlagMap = sectionName.rfind(flagMapPrefix, 0) == 0;
-            const std::wstring_view activePrefix = isFlagMap ? flagMapPrefix : valueMapPrefix;
-            if (sectionName.rfind(activePrefix, 0) != 0 ||
-                sectionName.size() <= activePrefix.size()) {
+            constexpr std::wstring_view textMapPrefix = L"TextMap.";
+            MappingKind mapKind = MappingKind::None;
+            std::wstring_view activePrefix;
+            if (sectionName.rfind(valueMapPrefix, 0) == 0) {
+                mapKind = MappingKind::Value;
+                activePrefix = valueMapPrefix;
+            } else if (sectionName.rfind(flagMapPrefix, 0) == 0) {
+                mapKind = MappingKind::Flag;
+                activePrefix = flagMapPrefix;
+            } else if (sectionName.rfind(textMapPrefix, 0) == 0) {
+                mapKind = MappingKind::Text;
+                activePrefix = textMapPrefix;
+            }
+            if (mapKind == MappingKind::None ||
+                sectionName.size() <= activePrefix.size() ||
+                sectionName.rfind(activePrefix, 0) != 0) {
                 error = L"Unknown configuration section on line " +
                     std::to_wstring(lineNumber) + L" in " + path;
                 return false;
@@ -1283,48 +1406,52 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
                 if (heading != mappings.end()) sourceName = heading->sourceName;
             }
             if (sourceName.empty()) {
-                error = L"Unknown value-map field '" + requestedField + L"' on line " +
+                error = L"Unknown map field '" + requestedField + L"' on line " +
                     std::to_wstring(lineNumber) + L" in " + path;
                 return false;
             }
-            if (!seenValueMapSections.insert(sourceName).second) {
-                error = L"Duplicate value or flag map section for '" + sourceName + L"' in " + path;
+            if (!seenMapSections.insert(sourceName).second) {
+                error = L"Duplicate map section for '" + sourceName + L"' in " + path;
                 return false;
             }
-            activeValueMapSource = std::move(sourceName);
-            activeFlagMap = isFlagMap;
-        } else if (!activeValueMapSource.empty()) {
+            activeMapSource = std::move(sourceName);
+            activeMapKind = mapKind;
+        } else if (activeMapKind != MappingKind::None) {
             const std::size_t equals = line.find(L'=');
             if (equals == std::wstring::npos) {
-                error = L"Expected numeric code=display label on line " +
+                error = L"Expected code=display label on line " +
                     std::to_wstring(lineNumber) + L" in " + path;
                 return false;
             }
             std::wstring code;
             const std::wstring codeText = trim(line.substr(0, equals));
             const std::wstring label = trim(line.substr(equals + 1));
-            if (!canonicalValueCode(codeText, code) || label.empty()) {
-                error = L"Value and flag map entries require a non-negative integer code and non-empty label on line " +
-                    std::to_wstring(lineNumber) + L" in " + path;
+            const bool validCode = activeMapKind == MappingKind::Text
+                ? canonicalAlpha3Code(codeText, code)
+                : canonicalValueCode(codeText, code);
+            if (!validCode || label.empty()) {
+                error = activeMapKind == MappingKind::Text
+                    ? L"Text-map entries require a three-letter ASCII code and non-empty label on line "
+                    : L"Value and flag map entries require a non-negative integer code and non-empty label on line ";
+                error += std::to_wstring(lineNumber) + L" in " + path;
                 return false;
             }
-            std::uint64_t flagValue = 0;
-            if (activeFlagMap &&
-                (!parseFlagCode(code, flagValue) ||
-                 (flagValue != 0 && (flagValue & (flagValue - 1)) != 0))) {
-                error = L"Flag-map codes must be zero or a single bit value on line " +
-                    std::to_wstring(lineNumber) + L" in " + path;
-                return false;
-            }
-            auto& entries = activeFlagMap ? parsedFlagMappings[activeValueMapSource]
-                                          : parsedValueMappings[activeValueMapSource];
+            auto& entries = activeMapKind == MappingKind::Flag
+                ? parsedFlagMappings[activeMapSource]
+                : activeMapKind == MappingKind::Text
+                    ? parsedTextMappings[activeMapSource]
+                    : parsedValueMappings[activeMapSource];
             const bool duplicateCode = std::any_of(entries.begin(), entries.end(),
                 [&code](const auto& entry) { return entry.first == code; });
             const bool duplicateLabel = std::any_of(entries.begin(), entries.end(),
-                [&label](const auto& entry) { return entry.second == label; });
+                [activeMapKind, &label](const auto& entry) {
+                    return activeMapKind == MappingKind::Text
+                        ? equalsIgnoreCase(entry.second, label)
+                        : entry.second == label;
+                });
             if (duplicateCode || duplicateLabel) {
                 error = L"Duplicate code or label in map section for '" +
-                    activeValueMapSource + L"' on line " + std::to_wstring(lineNumber) + L" in " + path;
+                    activeMapSource + L"' on line " + std::to_wstring(lineNumber) + L" in " + path;
                 return false;
             }
             entries.emplace_back(std::move(code), label);
@@ -1387,6 +1514,10 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
         const auto flagMap = parsedFlagMappings.find(mapping.sourceName);
         if (flagMap != parsedFlagMappings.end()) {
             mapping.flagMappings = flagMap->second;
+        }
+        const auto textMap = parsedTextMappings.find(mapping.sourceName);
+        if (textMap != parsedTextMappings.end()) {
+            mapping.textMappings = textMap->second;
         }
     }
     return true;

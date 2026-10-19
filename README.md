@@ -45,13 +45,17 @@ file containing every supported field with its original name as the heading.
 
 Optional `[ValueMap.<SDK field>]` sections map numeric enum values to labels,
 for example `[ValueMap.BookVolumeMode]` with `0=Default`, `1=Amounts`, and
-`2=Lots`. `[FlagMap.<SDK field>]` sections map `0` and individual flag bits;
-combined known flags display as labels joined by ` | `.
+`2=Lots`. `[FlagMap.<SDK field>]` sections map zero, individual bits, or exact
+combined values. Exact matches take precedence; otherwise known individual bits
+display as labels joined by ` | `. `[TextMap.<SDK field>]`
+sections map text codes to labels; `[TextMap.Country]` contains ISO 3166-1
+alpha-3 codes such as `USA=United States`.
 
-The app keeps unlisted enum codes and unknown flag combinations numeric, and
-accepts them unchanged. Excel import accepts configured labels or numeric
-values; labels are converted back to their SDK codes before applying. The
-shipped and first-launch defaults cover the SDK's enum and flag fields.
+The app keeps unmapped enum codes and unknown flag combinations numeric, and
+passes unknown text values through unchanged. Excel import accepts configured
+labels or codes; labels are converted back to their SDK values before applying.
+The shipped and first-launch defaults include the SDK's enum, flag, and country
+code mappings.
 
 ## Build
 

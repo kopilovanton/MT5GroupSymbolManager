@@ -21,6 +21,8 @@ struct SymbolFieldMapping {
     std::vector<std::pair<std::wstring, std::wstring>> valueMappings;
     // Optional bit value to label mappings for SDK flag fields.
     std::vector<std::pair<std::wstring, std::wstring>> flagMappings;
+    // Optional text-code to label mappings, such as ISO 3166-1 alpha-3 country codes.
+    std::vector<std::pair<std::wstring, std::wstring>> textMappings;
 };
 
 enum class ApplyChoice {
