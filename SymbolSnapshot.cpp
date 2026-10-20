@@ -65,6 +65,21 @@ std::wstring numberText(T value) {
     }
 }
 
+std::wstring precision8NumberText(double value) {
+    if (!std::isfinite(value)) return numberText(value);
+
+    wchar_t buffer[512]{};
+    if (swprintf_s(buffer, L"%.8f", value) < 0) return numberText(value);
+    std::wstring result(buffer);
+    const std::size_t decimalPoint = result.find(L'.');
+    if (decimalPoint != std::wstring::npos) {
+        while (!result.empty() && result.back() == L'0') result.pop_back();
+        if (!result.empty() && result.back() == L'.') result.pop_back();
+    }
+    if (result == L"-0") return L"0";
+    return result;
+}
+
 std::wstring timestampText(std::int64_t timestamp) {
     if (timestamp == 0) return L"0";
     const __time64_t value = static_cast<__time64_t>(timestamp);
@@ -218,6 +233,27 @@ bool writeNumber(std::wstring_view text, Getter getter, Setter setter,
     const MTAPIRES result = setter(parsed);
     if (result != MT_RET_OK) {
         error = L"SDK rejected the value (MTAPIRES=" +
+            std::to_wstring(static_cast<unsigned>(result)) + L").";
+        return false;
+    }
+    changed = true;
+    return true;
+}
+
+template <typename Getter, typename Setter>
+bool writePrecision8Number(std::wstring_view text, Getter getter, Setter setter,
+                           bool& changed, std::wstring& error) {
+    double parsed = 0;
+    if (!parseFieldNumber(text, parsed)) {
+        error = L"Invalid numeric value '" + std::wstring(text) + L"'.";
+        return false;
+    }
+    if (precision8NumberText(parsed) ==
+        precision8NumberText(static_cast<double>(getter()))) return true;
+
+    const MTAPIRES result = setter(parsed);
+    if (result != MT_RET_OK) {
+        error = L"SDK rejected the swap value (MTAPIRES=" +
             std::to_wstring(static_cast<unsigned>(result)) + L").";
         return false;
     }
@@ -543,9 +579,40 @@ bool parseVolumeLots(std::wstring_view text, std::uint64_t& volumeExt,
         return true;
     }
 
+    // Excel may serialize a valid step as the full decimal expansion of its binary double,
+    // for example 9.9999999999999995E-7 instead of 0.000001.
+    const auto acceptExcelFloatingPointValue = [&]() {
+        wchar_t* end = nullptr;
+        errno = 0;
+        const double lots = std::wcstod(value.c_str(), &end);
+        if (errno == ERANGE || end != value.c_str() + value.size() ||
+            !std::isfinite(lots) || lots < 0) {
+            return false;
+        }
+
+        const long double scaledLots = static_cast<long double>(lots) * volumeExtScale;
+        if (!std::isfinite(scaledLots) || scaledLots < 0 ||
+            scaledLots > static_cast<long double>(maxVolumeExt)) {
+            return false;
+        }
+
+        const long double nearestVolumeExt = std::round(scaledLots);
+        constexpr long double maxFloatingPointError = 0.0001L;
+        const long double tolerance = std::numeric_limits<double>::epsilon() *
+            (std::max)(std::abs(scaledLots), 1.0L) * 4.0L;
+        if (tolerance > maxFloatingPointError ||
+            std::abs(scaledLots - nearestVolumeExt) > tolerance) {
+            return false;
+        }
+
+        volumeExt = static_cast<std::uint64_t>(nearestVolumeExt);
+        return true;
+    };
+
     const std::int64_t scaledDigits = static_cast<std::int64_t>(digitsBeforeDecimal) +
         exponent + 8 - static_cast<std::int64_t>(firstNonZero);
     if (scaledDigits <= 0) {
+        if (acceptExcelFloatingPointValue()) return true;
         error = L"Volume precision cannot exceed 8 decimal places.";
         return false;
     }
@@ -556,6 +623,7 @@ bool parseVolumeLots(std::wstring_view text, std::uint64_t& volumeExt,
         const auto discardedStart = digits.begin() +
             static_cast<std::ptrdiff_t>(firstNonZero + integerDigits);
         if (std::any_of(discardedStart, digits.end(), [](wchar_t ch) { return ch != L'0'; })) {
+            if (acceptExcelFloatingPointValue()) return true;
             error = L"Volume precision cannot exceed 8 decimal places.";
             return false;
         }
@@ -776,6 +844,16 @@ std::vector<Property> makeProperties() {
             return writeNumber(text, [&]() { return symbol.name(); }, \
                 [&](auto value) { return symbol.name(value); }, changed, error); \
         }})
+#define ADD_PRECISION8_FIELD(name) \
+    properties.push_back({WIDEN(STRINGIFY(name)), \
+        [](const IMTConSymbol& symbol, IMTConSymbolSession*) { \
+            return precision8NumberText(symbol.name()); \
+        }, \
+        [](IMTConSymbol& symbol, std::wstring_view text, IMTConSymbolSession*, \
+           bool& changed, std::wstring& error) { \
+            return writePrecision8Number(text, [&]() { return symbol.name(); }, \
+                [&](auto value) { return symbol.name(value); }, changed, error); \
+        }})
 #define ADD_VOLUME_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) { \
@@ -911,8 +989,8 @@ std::vector<Property> makeProperties() {
     ADD_FIELD(MarginStop);
     ADD_FIELD(MarginStopLimit);
     ADD_FIELD(SwapMode);
-    ADD_FIELD(SwapLong);
-    ADD_FIELD(SwapShort);
+    ADD_PRECISION8_FIELD(SwapLong);
+    ADD_PRECISION8_FIELD(SwapShort);
     ADD_FIELD(Swap3Day);
     properties.push_back({L"TimeStart",
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) {
@@ -950,32 +1028,32 @@ std::vector<Property> makeProperties() {
     for (std::uint32_t type = 0; type < std::size(marginRateNames); ++type) {
         const std::wstring initialName = std::wstring(L"MarginRateInitial.") + marginRateNames[type];
         properties.push_back({initialName, [type](const IMTConSymbol& s, IMTConSymbolSession*) {
-            return numberText(s.MarginRateInitial(type));
+            return precision8NumberText(s.MarginRateInitial(type));
         }, [type](IMTConSymbol& s, std::wstring_view text, IMTConSymbolSession*,
                   bool& changed, std::wstring& error) {
-            return writeNumber(text, [&]() { return s.MarginRateInitial(type); },
+            return writePrecision8Number(text, [&]() { return s.MarginRateInitial(type); },
                 [&](auto value) { return s.MarginRateInitial(type, value); }, changed, error);
         }});
         const std::wstring maintenanceName = std::wstring(L"MarginRateMaintenance.") + marginRateNames[type];
         properties.push_back({maintenanceName, [type](const IMTConSymbol& s, IMTConSymbolSession*) {
-            return numberText(s.MarginRateMaintenance(type));
+            return precision8NumberText(s.MarginRateMaintenance(type));
         }, [type](IMTConSymbol& s, std::wstring_view text, IMTConSymbolSession*,
                   bool& changed, std::wstring& error) {
-            return writeNumber(text, [&]() { return s.MarginRateMaintenance(type); },
+            return writePrecision8Number(text, [&]() { return s.MarginRateMaintenance(type); },
                 [&](auto value) { return s.MarginRateMaintenance(type, value); }, changed, error);
         }});
     }
 
     ADD_FIELD(OptionsMode);
     ADD_FIELD(PriceStrike);
-    ADD_FIELD(MarginRateLiquidity);
+    ADD_PRECISION8_FIELD(MarginRateLiquidity);
     ADD_FIELD(FaceValue);
     ADD_FIELD(AccruedInterest);
     ADD_FIELD(SpliceType);
     ADD_FIELD(SpliceTimeType);
     ADD_FIELD(SpliceTimeDays);
     ADD_FIELD(MarginHedged);
-    ADD_FIELD(MarginRateCurrency);
+    ADD_PRECISION8_FIELD(MarginRateCurrency);
     ADD_FIELD(FilterGap);
     ADD_FIELD(FilterGapTicks);
     ADD_FIELD(ChartMode);
@@ -1067,6 +1145,7 @@ std::vector<Property> makeProperties() {
 #undef ADD_TEXT_FIELD
 #undef ADD_VOLUME_FIELD
 #undef ADD_COLOR_FIELD
+#undef ADD_PRECISION8_FIELD
 #undef ADD_READONLY_FIELD
 #undef ADD_FIELD
 #undef WIDEN
@@ -1873,14 +1952,50 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
                 continue;
             }
             const MTAPIRES restoreResult = admin->SymbolUpdate(symbol);
-            if (restoreResult == MT_RET_OK) ++result.restored;
-            else {
+            if (restoreResult != MT_RET_OK) {
                 ++result.restoreFailed;
                 if (result.firstFailure.empty()) {
                     result.firstFailure = L"Could not restore symbol '" + name + L"': " +
                         apiError(L"SymbolUpdate", restoreResult);
                 }
+                continue;
             }
+
+            const MTAPIRES verifyRestoreResult = admin->SymbolGet(name.c_str(), symbol);
+            if (verifyRestoreResult != MT_RET_OK) {
+                ++result.restoreFailed;
+                if (result.firstFailure.empty()) {
+                    result.firstFailure = L"Symbol '" + name +
+                        L"' was restored, but the restored values could not be verified: " +
+                        apiError(L"SymbolGet", verifyRestoreResult);
+                }
+                continue;
+            }
+
+            bool restored = true;
+            for (const Property& property : backupProperties) {
+                if (!property.editable || !property.write) continue;
+
+                const std::wstring expectedValue = property.read(*original->second, session);
+                const std::wstring actualValue = property.read(*symbol, session);
+                bool wouldChange = false;
+                std::wstring verifyError;
+                if (!property.write(*symbol, expectedValue, session, wouldChange, verifyError) ||
+                    wouldChange) {
+                    restored = false;
+                    if (result.firstFailure.empty()) {
+                        result.firstFailure = L"Symbol '" + name + L"', field '" +
+                            property.name + L"' was not restored. Expected '" + expectedValue +
+                            L"', server returned '" + actualValue + L"'.";
+                        if (!verifyError.empty()) {
+                            result.firstFailure += L" " + verifyError;
+                        }
+                    }
+                    break;
+                }
+            }
+            if (restored) ++result.restored;
+            else ++result.restoreFailed;
         }
         if (checkpoint) checkpoint({attempted.size(), attempted.size(), true, L""});
     }
