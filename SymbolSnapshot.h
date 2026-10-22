@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -11,6 +12,34 @@ struct SymbolSnapshot {
     std::vector<std::wstring> sourceNames;
     std::vector<std::vector<std::wstring>> rows;
     std::uint32_t failedSymbols = 0;
+};
+
+enum class SymbolFieldValueKind {
+    Text,
+    SignedInteger32,
+    UnsignedInteger32,
+    SignedInteger64,
+    UnsignedInteger64,
+    FloatingPoint,
+    VolumeLots,
+    Color,
+    Timestamp,
+    Session
+};
+
+struct SymbolValueRange {
+    double minimum = 0;
+    double maximum = 0;
+};
+
+struct SymbolValueConstraint {
+    bool hasMinimum = false;
+    double minimum = 0;
+    bool hasMaximum = false;
+    double maximum = 0;
+    bool hasMaxChars = false;
+    std::size_t maxChars = 0;
+    std::vector<SymbolValueRange> allowedValues;
 };
 
 struct SymbolFieldMapping {
@@ -23,6 +52,8 @@ struct SymbolFieldMapping {
     std::vector<std::pair<std::wstring, std::wstring>> flagMappings;
     // Optional text-code to label mappings, such as ISO 3166-1 alpha-3 country codes.
     std::vector<std::pair<std::wstring, std::wstring>> textMappings;
+    SymbolFieldValueKind valueKind = SymbolFieldValueKind::Text;
+    SymbolValueConstraint constraint;
 };
 
 enum class ApplyChoice {
@@ -63,6 +94,9 @@ std::wstring SymbolValueForDisplay(const SymbolFieldMapping& mapping,
                                    const std::wstring& value);
 std::wstring SymbolValueForStorage(const SymbolFieldMapping& mapping,
                                    const std::wstring& value);
+bool ValidateSymbolFieldValue(const SymbolFieldMapping& mapping,
+                              std::wstring_view value,
+                              std::wstring& error);
 
 bool LoadSymbolSnapshot(const std::wstring& server,
                         const std::wstring& loginText,

@@ -8,6 +8,7 @@
 #pragma warning(pop)
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cmath>
 #include <cwchar>
@@ -114,7 +115,23 @@ struct Property {
     std::function<bool(IMTConSymbol&, std::wstring_view, IMTConSymbolSession*,
                        bool&, std::wstring&)> write;
     bool editable = true;
+    SymbolFieldValueKind valueKind = SymbolFieldValueKind::Text;
 };
+
+template <typename T>
+constexpr SymbolFieldValueKind numericValueKind() {
+    if constexpr (std::is_floating_point_v<T>) {
+        return SymbolFieldValueKind::FloatingPoint;
+    } else if constexpr (std::is_signed_v<T>) {
+        return sizeof(T) <= sizeof(std::int32_t)
+            ? SymbolFieldValueKind::SignedInteger32
+            : SymbolFieldValueKind::SignedInteger64;
+    } else {
+        return sizeof(T) <= sizeof(std::uint32_t)
+            ? SymbolFieldValueKind::UnsignedInteger32
+            : SymbolFieldValueKind::UnsignedInteger64;
+    }
+}
 
 std::wstring trim(std::wstring value);
 
@@ -772,6 +789,125 @@ bool parseFlagCode(std::wstring_view text, std::uint64_t& value,
     return true;
 }
 
+bool parseConstraintNumber(std::wstring_view text, double& value) {
+    const std::wstring cleaned = trim(std::wstring(text));
+    if (cleaned.empty()) return false;
+    wchar_t* end = nullptr;
+    errno = 0;
+    const double parsed = std::wcstod(cleaned.c_str(), &end);
+    if (errno == ERANGE || end != cleaned.c_str() + cleaned.size() || !std::isfinite(parsed)) {
+        return false;
+    }
+    value = parsed;
+    return true;
+}
+
+bool parseSymbolValueConstraint(std::wstring_view text,
+                                SymbolValueConstraint& constraint) {
+    std::array<std::wstring, 4> parts;
+    std::size_t start = 0;
+    for (std::size_t index = 0; index < parts.size(); ++index) {
+        const std::size_t separator = text.find(L'|', start);
+        if (index + 1 < parts.size() && separator == std::wstring_view::npos) return false;
+        if (index + 1 == parts.size() && separator != std::wstring_view::npos) return false;
+        parts[index] = trim(std::wstring(text.substr(start,
+            separator == std::wstring_view::npos ? std::wstring_view::npos : separator - start)));
+        if (separator == std::wstring_view::npos) break;
+        start = separator + 1;
+    }
+
+    if (!parts[0].empty()) {
+        if (!parseConstraintNumber(parts[0], constraint.minimum)) return false;
+        constraint.hasMinimum = true;
+    }
+    if (!parts[1].empty()) {
+        if (!parseConstraintNumber(parts[1], constraint.maximum)) return false;
+        constraint.hasMaximum = true;
+    }
+    if (constraint.hasMinimum && constraint.hasMaximum &&
+        constraint.minimum > constraint.maximum) return false;
+    if (!parts[2].empty()) {
+        for (const wchar_t ch : parts[2]) {
+            if (ch < L'0' || ch > L'9') return false;
+        }
+        wchar_t* end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::wcstoull(parts[2].c_str(), &end, 10);
+        if (errno == ERANGE || end != parts[2].c_str() + parts[2].size() ||
+            parsed > (std::numeric_limits<std::size_t>::max)()) return false;
+        constraint.maxChars = static_cast<std::size_t>(parsed);
+        constraint.hasMaxChars = true;
+    }
+    if (!parts[3].empty()) {
+        std::size_t rangeStart = 0;
+        while (rangeStart <= parts[3].size()) {
+            const std::size_t comma = parts[3].find(L',', rangeStart);
+            const std::wstring token = trim(parts[3].substr(rangeStart,
+                comma == std::wstring::npos ? std::wstring::npos : comma - rangeStart));
+            if (token.empty()) return false;
+            const std::size_t rangeSeparator = token.find(L"..");
+            SymbolValueRange range;
+            if (rangeSeparator == std::wstring::npos) {
+                if (!parseConstraintNumber(token, range.minimum)) return false;
+                range.maximum = range.minimum;
+            } else {
+                if (token.find(L"..", rangeSeparator + 2) != std::wstring::npos ||
+                    !parseConstraintNumber(std::wstring_view(token).substr(0, rangeSeparator), range.minimum) ||
+                    !parseConstraintNumber(std::wstring_view(token).substr(rangeSeparator + 2), range.maximum) ||
+                    range.minimum > range.maximum) return false;
+            }
+            constraint.allowedValues.push_back(range);
+            if (comma == std::wstring::npos) break;
+            rangeStart = comma + 1;
+        }
+    }
+    return true;
+}
+
+std::wstring sdkConstraintForField(std::wstring_view sourceName) {
+    // Enum codes, bit masks and unsigned integer limits below are derived from
+    // the field declarations in the installed MT5 SDK. Other fields get empty
+    // template slots because the SDK does not define semantic limits.
+    if (sourceName == L"Sector") return L"|||0..15";
+    if (sourceName == L"Industry") return L"|||0,1..14,51..57,101..123,151..162,201..208,251..269,301..311,351..375,401..412,451..462,501..506,551..554";
+    if (sourceName == L"CalcMode") return L"|||0..5,32..39,64";
+    if (sourceName == L"TradeMode") return L"|||0..4";
+    if (sourceName == L"ExecMode") return L"|||0..3";
+    if (sourceName == L"GTCMode") return L"|||0..2";
+    if (sourceName == L"FillFlags") return L"0|7||";
+    if (sourceName == L"ExpirFlags") return L"0|15||";
+    if (sourceName == L"OrderFlags") return L"0|127||";
+    if (sourceName == L"TradeFlags") return L"0|3||";
+    if (sourceName == L"MarginFlags") return L"0|31||";
+    if (sourceName == L"SwapMode") return L"|||0..9";
+    if (sourceName == L"Swap3Day") return L"|||0..7";
+    if (sourceName == L"SwapFlags" || sourceName == L"REFlags" || sourceName == L"IEFlags") {
+        return L"0|1||";
+    }
+    if (sourceName == L"IECheckMode" || sourceName == L"SpliceTimeType") return L"|||0";
+    if (sourceName == L"OptionsMode") return L"|||0..3";
+    if (sourceName == L"SpliceType") return L"|||0..2";
+    if (sourceName == L"ChartMode") return L"|||0,1,255";
+    if (sourceName == L"BookVolumeMode") return L"|||0..2";
+    if (sourceName == L"TickFlags") return L"0|15||";
+    if (sourceName == L"VolumeMin" || sourceName == L"VolumeMax" ||
+        sourceName == L"VolumeStep" || sourceName == L"VolumeLimit" ||
+        sourceName == L"IEVolumeMax" || sourceName == L"IEVolumeMaxExt") {
+        return L"0|||";
+    }
+    constexpr std::wstring_view unsigned32Fields[] = {
+        L"Digits", L"Spread", L"CurrencyBaseDigits", L"CurrencyProfitDigits",
+        L"CurrencyMarginDigits", L"TickBookDepth", L"FilterSoft", L"FilterSoftTicks",
+        L"FilterHard", L"FilterHardTicks", L"FilterDiscard", L"FilterGap",
+        L"FilterGapTicks", L"FilterSpreadMin", L"FilterSpreadMax", L"QuotesTimeout",
+        L"RETimeout", L"IETimeout", L"IESlipProfit", L"IESlipLosing",
+        L"SpliceTimeDays", L"SubscriptionsDelay"
+    };
+    if (std::find(std::begin(unsigned32Fields), std::end(unsigned32Fields), sourceName) !=
+        std::end(unsigned32Fields)) return L"0|4294967295||";
+    return L"|||";
+}
+
 std::wstring serverValueForField(const SymbolFieldMapping& mapping,
                                  const std::wstring& value) {
     return SymbolValueForStorage(mapping, value);
@@ -798,6 +934,19 @@ bool writeDefaultSymbolMappings(const std::wstring& path,
             return false;
         }
         output << source << '=' << source << '\n';
+    }
+    output << "\n# Value constraints. Format: SourceField=minimum|maximum|maxChars|allowedValues.\n"
+              "# Empty slots disable that check. Numeric bounds use displayed units.\n"
+              "# allowedValues is a comma-separated list of numbers and inclusive min..max ranges.\n"
+              "[Constraints]\n";
+    for (const Property& property : properties) {
+        if (isHiddenVolumeExtField(property.name)) continue;
+        const std::string source = encodeUtf8(property.name);
+        if (source.empty()) {
+            error = L"Cannot encode a symbol field name in UTF-8.";
+            return false;
+        }
+        output << source << '=' << encodeUtf8(sdkConstraintForField(property.name)) << '\n';
     }
     output << '\n' << kDefaultSymbolValueMaps << '\n';
     output.close();
@@ -843,7 +992,8 @@ std::vector<Property> makeProperties() {
            bool& changed, std::wstring& error) { \
             return writeNumber(text, [&]() { return symbol.name(); }, \
                 [&](auto value) { return symbol.name(value); }, changed, error); \
-        }})
+        }}); \
+    properties.back().valueKind = numericValueKind<decltype(std::declval<const IMTConSymbol&>().name())>()
 #define ADD_PRECISION8_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) { \
@@ -853,7 +1003,8 @@ std::vector<Property> makeProperties() {
            bool& changed, std::wstring& error) { \
             return writePrecision8Number(text, [&]() { return symbol.name(); }, \
                 [&](auto value) { return symbol.name(value); }, changed, error); \
-        }})
+        }}); \
+    properties.back().valueKind = SymbolFieldValueKind::FloatingPoint
 #define ADD_VOLUME_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) { \
@@ -870,7 +1021,8 @@ std::vector<Property> makeProperties() {
                 [&]() { return symbol.name##Ext(); }, \
                 [&](std::uint64_t value) { return symbol.name##Ext(value); }, \
                 changed, error); \
-        }})
+        }}); \
+    properties.back().valueKind = SymbolFieldValueKind::VolumeLots
 #define ADD_TEXT_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) { \
@@ -880,7 +1032,8 @@ std::vector<Property> makeProperties() {
            bool& changed, std::wstring& error) { \
             return writeText(text, [&]() { return symbol.name(); }, \
                 [&](LPCWSTR value) { return symbol.name(value); }, changed, error); \
-        }})
+        }}); \
+    properties.back().valueKind = SymbolFieldValueKind::Text
 #define ADD_READONLY_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) { \
@@ -890,7 +1043,8 @@ std::vector<Property> makeProperties() {
            bool&, std::wstring& error) { \
             return validateReadOnlyNumber(text, [&]() { return symbol.name(); }, \
                 WIDEN(STRINGIFY(name)), error); \
-        }, false})
+        }, false}); \
+    properties.back().valueKind = numericValueKind<decltype(std::declval<const IMTConSymbol&>().name())>()
 #define ADD_COLOR_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) { return colorText(symbol.name()); }, \
@@ -898,7 +1052,8 @@ std::vector<Property> makeProperties() {
            bool& changed, std::wstring& error) { \
             return writeColor(text, [&]() { return symbol.name(); }, \
                 [&](COLORREF value) { return symbol.name(value); }, changed, error); \
-        }})
+        }}); \
+    properties.back().valueKind = SymbolFieldValueKind::Color
 
     properties.push_back({L"Symbol",
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) { return cleanText(symbol.Symbol()); },
@@ -916,6 +1071,8 @@ std::vector<Property> makeProperties() {
             error = L"The Path field cannot be changed during import.";
             return false;
         }, false});
+    properties[properties.size() - 2].valueKind = SymbolFieldValueKind::Text;
+    properties.back().valueKind = SymbolFieldValueKind::Text;
     ADD_TEXT_FIELD(ISIN);
     ADD_TEXT_FIELD(Description);
     ADD_TEXT_FIELD(International);
@@ -930,6 +1087,7 @@ std::vector<Property> makeProperties() {
             return writeNumber(text, [&]() { return symbol.CurrencyBaseDigits(); },
                 [&](auto value) { return symbol.CurrencyBaseDigitsSet(value); }, changed, error);
         }});
+    properties.back().valueKind = numericValueKind<decltype(std::declval<const IMTConSymbol&>().CurrencyBaseDigits())>();
     ADD_TEXT_FIELD(CurrencyProfit);
     properties.push_back({L"CurrencyProfitDigits",
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) { return numberText(symbol.CurrencyProfitDigits()); },
@@ -938,6 +1096,7 @@ std::vector<Property> makeProperties() {
             return writeNumber(text, [&]() { return symbol.CurrencyProfitDigits(); },
                 [&](auto value) { return symbol.CurrencyProfitDigitsSet(value); }, changed, error);
         }});
+    properties.back().valueKind = numericValueKind<decltype(std::declval<const IMTConSymbol&>().CurrencyProfitDigits())>();
     ADD_TEXT_FIELD(CurrencyMargin);
     properties.push_back({L"CurrencyMarginDigits",
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) { return numberText(symbol.CurrencyMarginDigits()); },
@@ -946,6 +1105,7 @@ std::vector<Property> makeProperties() {
             return writeNumber(text, [&]() { return symbol.CurrencyMarginDigits(); },
                 [&](auto value) { return symbol.CurrencyMarginDigitsSet(value); }, changed, error);
         }});
+    properties.back().valueKind = numericValueKind<decltype(std::declval<const IMTConSymbol&>().CurrencyMarginDigits())>();
     ADD_COLOR_FIELD(Color);
     ADD_COLOR_FIELD(ColorBackground);
     ADD_FIELD(Digits);
@@ -1000,6 +1160,7 @@ std::vector<Property> makeProperties() {
             return writeTimestamp(text, [&]() { return symbol.TimeStart(); },
                 [&](std::int64_t value) { return symbol.TimeStart(value); }, changed, error);
         }});
+    properties.back().valueKind = SymbolFieldValueKind::Timestamp;
     properties.push_back({L"TimeExpiration",
         [](const IMTConSymbol& symbol, IMTConSymbolSession*) {
             return timestampText(symbol.TimeExpiration());
@@ -1008,6 +1169,7 @@ std::vector<Property> makeProperties() {
             return writeTimestamp(text, [&]() { return symbol.TimeExpiration(); },
                 [&](std::int64_t value) { return symbol.TimeExpiration(value); }, changed, error);
         }});
+    properties.back().valueKind = SymbolFieldValueKind::Timestamp;
     ADD_FIELD(REFlags);
     ADD_FIELD(RETimeout);
     ADD_FIELD(IECheckMode);
@@ -1034,6 +1196,7 @@ std::vector<Property> makeProperties() {
             return writePrecision8Number(text, [&]() { return s.MarginRateInitial(type); },
                 [&](auto value) { return s.MarginRateInitial(type, value); }, changed, error);
         }});
+        properties.back().valueKind = SymbolFieldValueKind::FloatingPoint;
         const std::wstring maintenanceName = std::wstring(L"MarginRateMaintenance.") + marginRateNames[type];
         properties.push_back({maintenanceName, [type](const IMTConSymbol& s, IMTConSymbolSession*) {
             return precision8NumberText(s.MarginRateMaintenance(type));
@@ -1042,6 +1205,7 @@ std::vector<Property> makeProperties() {
             return writePrecision8Number(text, [&]() { return s.MarginRateMaintenance(type); },
                 [&](auto value) { return s.MarginRateMaintenance(type, value); }, changed, error);
         }});
+        properties.back().valueKind = SymbolFieldValueKind::FloatingPoint;
     }
 
     ADD_FIELD(OptionsMode);
@@ -1112,6 +1276,7 @@ std::vector<Property> makeProperties() {
                     return s.SessionQuoteAdd(weekday, item);
                 }, changed, error);
         }});
+        properties.back().valueKind = SymbolFieldValueKind::Session;
 
         const std::wstring tradeName = std::wstring(L"TradeSessions.") + dayNames[day];
         properties.push_back({tradeName, [day](const IMTConSymbol& s, IMTConSymbolSession* session) {
@@ -1140,6 +1305,7 @@ std::vector<Property> makeProperties() {
                     return s.SessionTradeAdd(weekday, item);
                 }, changed, error);
         }});
+        properties.back().valueKind = SymbolFieldValueKind::Session;
     }
 
 #undef ADD_TEXT_FIELD
@@ -1370,6 +1536,137 @@ std::wstring SymbolValueForStorage(const SymbolFieldMapping& mapping,
     return value;
 }
 
+bool ValidateSymbolFieldValue(const SymbolFieldMapping& mapping,
+                              std::wstring_view value,
+                              std::wstring& error) {
+    error.clear();
+    const SymbolValueConstraint& constraint = mapping.constraint;
+    if (constraint.hasMaxChars && value.size() > constraint.maxChars) {
+        error = L"Value exceeds the configured maxChars limit of " +
+            std::to_wstring(constraint.maxChars) + L".";
+        return false;
+    }
+
+    const bool needsNumber = constraint.hasMinimum || constraint.hasMaximum ||
+        !constraint.allowedValues.empty();
+    double number = 0;
+    bool hasNumericValue = false;
+    switch (mapping.valueKind) {
+    case SymbolFieldValueKind::SignedInteger32: {
+        std::int32_t parsed = 0;
+        if (!parseFieldNumber(value, parsed)) {
+            error = L"Value must be a valid signed 32-bit integer.";
+            return false;
+        }
+        number = static_cast<double>(parsed);
+        hasNumericValue = true;
+        break;
+    }
+    case SymbolFieldValueKind::UnsignedInteger32: {
+        std::uint32_t parsed = 0;
+        if (!parseFieldNumber(value, parsed)) {
+            error = L"Value must be a valid unsigned 32-bit integer.";
+            return false;
+        }
+        number = static_cast<double>(parsed);
+        hasNumericValue = true;
+        break;
+    }
+    case SymbolFieldValueKind::SignedInteger64: {
+        std::int64_t parsed = 0;
+        if (!parseFieldNumber(value, parsed)) {
+            error = L"Value must be a valid signed 64-bit integer.";
+            return false;
+        }
+        number = static_cast<double>(parsed);
+        hasNumericValue = true;
+        break;
+    }
+    case SymbolFieldValueKind::UnsignedInteger64: {
+        std::uint64_t parsed = 0;
+        if (!parseFieldNumber(value, parsed)) {
+            error = L"Value must be a valid unsigned 64-bit integer.";
+            return false;
+        }
+        number = static_cast<double>(parsed);
+        hasNumericValue = true;
+        break;
+    }
+    case SymbolFieldValueKind::FloatingPoint:
+        if (!parseConstraintNumber(value, number)) {
+            error = L"Value must be a finite number.";
+            return false;
+        }
+        hasNumericValue = true;
+        break;
+    case SymbolFieldValueKind::VolumeLots: {
+        std::uint64_t volumeExt = 0;
+        if (!parseVolumeLots(value, volumeExt, error)) return false;
+        if (!parseConstraintNumber(value, number)) {
+            error = L"Value must be a finite volume in lots.";
+            return false;
+        }
+        hasNumericValue = true;
+        break;
+    }
+    case SymbolFieldValueKind::Color: {
+        COLORREF color = 0;
+        if (!parseColor(value, color)) {
+            error = L"Value must be a color in #RRGGBB or 0xAARRGGBB format.";
+            return false;
+        }
+        number = static_cast<double>(color);
+        hasNumericValue = true;
+        break;
+    }
+    case SymbolFieldValueKind::Timestamp: {
+        std::int64_t timestamp = 0;
+        if (!parseTimestamp(value, timestamp)) {
+            error = L"Value must be a UTC date/time or Unix timestamp.";
+            return false;
+        }
+        number = static_cast<double>(timestamp);
+        hasNumericValue = true;
+        break;
+    }
+    case SymbolFieldValueKind::Session: {
+        std::vector<SessionRange> ranges;
+        if (!parseSessions(value, ranges)) {
+            error = L"Value must contain valid session ranges in HH:mm-HH:mm format.";
+            return false;
+        }
+        break;
+    }
+    case SymbolFieldValueKind::Text:
+        break;
+    }
+
+    if (!needsNumber) return true;
+    if (!hasNumericValue && !parseConstraintNumber(value, number)) {
+        error = L"Value must be a finite number for the configured constraint.";
+        return false;
+    }
+    if (constraint.hasMinimum && number < constraint.minimum) {
+        error = L"Value is below the configured minimum " + numberText(constraint.minimum) + L".";
+        return false;
+    }
+    if (constraint.hasMaximum && number > constraint.maximum) {
+        error = L"Value exceeds the configured maximum " + numberText(constraint.maximum) + L".";
+        return false;
+    }
+    if (!constraint.allowedValues.empty()) {
+        const bool allowed = std::any_of(constraint.allowedValues.begin(), constraint.allowedValues.end(),
+            [number](const SymbolValueRange& range) {
+                return number >= range.minimum && number <= range.maximum;
+            });
+        if (!allowed) {
+            error = L"Value is not listed in the configured allowedValues.";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool IsSymbolFieldEditable(const std::wstring& sourceName) {
     static const std::unordered_set<std::wstring> readOnlyFields = [] {
         std::unordered_set<std::wstring> fields;
@@ -1428,9 +1725,11 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
         std::vector<std::pair<std::wstring, std::wstring>>> parsedFlagMappings;
     std::unordered_map<std::wstring,
         std::vector<std::pair<std::wstring, std::wstring>>> parsedTextMappings;
-    enum class MappingKind { None, Value, Flag, Text };
+    std::unordered_map<std::wstring, SymbolValueConstraint> parsedConstraints;
+    enum class MappingKind { None, Value, Flag, Text, Constraints };
     std::wstring activeMapSource;
     MappingKind activeMapKind = MappingKind::None;
+    bool seenConstraintsSection = false;
     bool dividerPending = false;
     std::size_t lineNumber = 0;
     std::size_t start = 0;
@@ -1445,6 +1744,15 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
             // Comments are accepted in both the column mapping list and map sections.
         } else if (line.front() == L'[' && line.back() == L']') {
             const std::wstring sectionName = trim(line.substr(1, line.size() - 2));
+            if (sectionName == L"Constraints") {
+                if (seenConstraintsSection) {
+                    error = L"Duplicate [Constraints] section in " + path;
+                    return false;
+                }
+                seenConstraintsSection = true;
+                activeMapSource.clear();
+                activeMapKind = MappingKind::Constraints;
+            } else {
             constexpr std::wstring_view valueMapPrefix = L"ValueMap.";
             constexpr std::wstring_view flagMapPrefix = L"FlagMap.";
             constexpr std::wstring_view textMapPrefix = L"TextMap.";
@@ -1495,6 +1803,34 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
             }
             activeMapSource = std::move(sourceName);
             activeMapKind = mapKind;
+            }
+        } else if (activeMapKind == MappingKind::Constraints) {
+            const std::size_t equals = line.find(L'=');
+            if (equals == std::wstring::npos) {
+                error = L"Expected SourceField=minimum|maximum|maxChars|allowedValues on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            const std::wstring sourceName = trim(line.substr(0, equals));
+            const auto knownField = std::find_if(availableProperties.begin(), availableProperties.end(),
+                [&sourceName](const Property& property) { return property.name == sourceName; });
+            if (knownField == availableProperties.end()) {
+                error = L"Unknown constrained field '" + sourceName + L"' on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            SymbolValueConstraint constraint;
+            if (!parseSymbolValueConstraint(std::wstring_view(line).substr(equals + 1), constraint)) {
+                error = L"Invalid value constraint for '" + sourceName + L"' on line " +
+                    std::to_wstring(lineNumber) + L" in " + path +
+                    L". Expected minimum|maximum|maxChars|allowedValues.";
+                return false;
+            }
+            if (!parsedConstraints.emplace(sourceName, std::move(constraint)).second) {
+                error = L"Duplicate constraint for '" + sourceName + L"' on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
         } else if (activeMapKind != MappingKind::None) {
             const std::size_t equals = line.find(L'=');
             if (equals == std::wstring::npos) {
@@ -1586,6 +1922,9 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
     ensureProtectedField(L"Symbol", L"Common.Symbol");
     ensureProtectedField(L"Path", L"Common.Path");
     for (SymbolFieldMapping& mapping : mappings) {
+        const auto property = std::find_if(availableProperties.begin(), availableProperties.end(),
+            [&mapping](const Property& candidate) { return candidate.name == mapping.sourceName; });
+        if (property != availableProperties.end()) mapping.valueKind = property->valueKind;
         const auto valueMap = parsedValueMappings.find(mapping.sourceName);
         if (valueMap != parsedValueMappings.end()) {
             mapping.valueMappings = valueMap->second;
@@ -1597,6 +1936,10 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
         const auto textMap = parsedTextMappings.find(mapping.sourceName);
         if (textMap != parsedTextMappings.end()) {
             mapping.textMappings = textMap->second;
+        }
+        const auto constraint = parsedConstraints.find(mapping.sourceName);
+        if (constraint != parsedConstraints.end()) {
+            mapping.constraint = constraint->second;
         }
     }
     return true;
@@ -1707,6 +2050,16 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
         if (!requestedNames.insert(row[symbolColumn]).second) {
             error = L"The workbook contains the duplicate symbol '" + row[symbolColumn] + L"'.";
             return false;
+        }
+        for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
+            std::wstring validationError;
+            const std::wstring storageValue = SymbolValueForStorage(fieldMappings[column], row[column]);
+            if (!ValidateSymbolFieldValue(fieldMappings[column], storageValue, validationError)) {
+                error = L"Symbol '" + row[symbolColumn] + L"', field '" +
+                    fieldMappings[column].sourceName + L"': " + validationError +
+                    L" No values were applied.";
+                return false;
+            }
         }
     }
 

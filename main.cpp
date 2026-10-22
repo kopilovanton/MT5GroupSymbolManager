@@ -159,6 +159,7 @@ SymbolSnapshot serverSnapshot;
 SymbolSnapshot manualEditBaseline;
 using ChangedCellMap = std::unordered_map<std::wstring, std::unordered_set<std::size_t>>;
 ChangedCellMap importedChangedCells;
+ChangedCellMap invalidSymbolCells;
 std::size_t currentSymbolColumn = (std::numeric_limits<std::size_t>::max)();
 std::shared_ptr<AsyncState> asyncState = std::make_shared<AsyncState>();
 std::shared_ptr<ApplyAsyncState> applyAsyncState = std::make_shared<ApplyAsyncState>();
@@ -1000,6 +1001,109 @@ bool hasUncommittedCellEdit() {
     return cellEditor && getText(cellEditor) != cellEditorOriginalValue;
 }
 
+bool cellValueError(std::size_t rowIndex, std::size_t columnIndex,
+                    std::wstring_view value, std::wstring& error) {
+    error.clear();
+    if (columnIndex >= currentSnapshot.sourceNames.size() ||
+        rowIndex >= currentSnapshot.rows.size()) return false;
+    const std::wstring& sourceName = currentSnapshot.sourceNames[columnIndex];
+    const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
+        [&sourceName](const SymbolFieldMapping& field) { return field.sourceName == sourceName; });
+    if (mapping == symbolFieldMappings.end()) return false;
+    const std::wstring storageValue = SymbolValueForStorage(*mapping, std::wstring(value));
+    return !ValidateSymbolFieldValue(*mapping, storageValue, error);
+}
+
+void rebuildInvalidCellMap() {
+    invalidSymbolCells.clear();
+    if (currentSymbolColumn >= currentSnapshot.sourceNames.size()) return;
+
+    std::vector<const SymbolFieldMapping*> mappingsByColumn(currentSnapshot.sourceNames.size(), nullptr);
+    for (std::size_t column = 0; column < currentSnapshot.sourceNames.size(); ++column) {
+        const std::wstring& sourceName = currentSnapshot.sourceNames[column];
+        const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
+            [&sourceName](const SymbolFieldMapping& field) { return field.sourceName == sourceName; });
+        if (mapping != symbolFieldMappings.end()) mappingsByColumn[column] = &*mapping;
+    }
+
+    for (std::size_t row = 0; row < currentSnapshot.rows.size(); ++row) {
+        if (currentSymbolColumn >= currentSnapshot.rows[row].size()) continue;
+        const std::wstring& symbol = currentSnapshot.rows[row][currentSymbolColumn];
+        if (symbol.empty()) continue;
+        for (std::size_t column = 0; column < currentSnapshot.sourceNames.size() &&
+             column < currentSnapshot.rows[row].size(); ++column) {
+            const SymbolFieldMapping* mapping = mappingsByColumn[column];
+            if (!mapping) continue;
+            const SymbolValueConstraint& constraint = mapping->constraint;
+            if (!constraint.hasMinimum && !constraint.hasMaximum && !constraint.hasMaxChars &&
+                constraint.allowedValues.empty()) continue;
+            std::wstring validationError;
+            const std::wstring storageValue = SymbolValueForStorage(*mapping, currentSnapshot.rows[row][column]);
+            if (!ValidateSymbolFieldValue(*mapping, storageValue, validationError)) {
+                invalidSymbolCells[symbol].insert(column);
+            }
+        }
+    }
+}
+
+void updateInvalidCellState(std::size_t rowIndex, std::size_t columnIndex) {
+    if (rowIndex >= currentSnapshot.rows.size() ||
+        columnIndex >= currentSnapshot.rows[rowIndex].size() ||
+        currentSymbolColumn >= currentSnapshot.rows[rowIndex].size()) return;
+    const std::wstring& symbol = currentSnapshot.rows[rowIndex][currentSymbolColumn];
+    std::wstring error;
+    const bool invalid = cellValueError(rowIndex, columnIndex,
+        currentSnapshot.rows[rowIndex][columnIndex], error);
+    if (invalid) {
+        invalidSymbolCells[symbol].insert(columnIndex);
+        return;
+    }
+    const auto existing = invalidSymbolCells.find(symbol);
+    if (existing == invalidSymbolCells.end()) return;
+    existing->second.erase(columnIndex);
+    if (existing->second.empty()) invalidSymbolCells.erase(existing);
+}
+
+std::size_t invalidCellCount() {
+    std::size_t count = 0;
+    for (const auto& [symbol, columns] : invalidSymbolCells) {
+        (void)symbol;
+        count += columns.size();
+    }
+    return count;
+}
+
+std::wstring firstInvalidCellMessage() {
+    if (currentSymbolColumn >= currentSnapshot.sourceNames.size()) return {};
+    for (const auto& row : currentSnapshot.rows) {
+        if (currentSymbolColumn >= row.size()) continue;
+        const std::wstring& symbol = row[currentSymbolColumn];
+        const auto invalid = invalidSymbolCells.find(symbol);
+        if (invalid == invalidSymbolCells.end()) continue;
+        for (const std::size_t column : invalid->second) {
+            if (column >= currentSnapshot.sourceNames.size() || column >= row.size()) continue;
+            const std::wstring& sourceName = currentSnapshot.sourceNames[column];
+            const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
+                [&sourceName](const SymbolFieldMapping& field) { return field.sourceName == sourceName; });
+            if (mapping == symbolFieldMappings.end()) continue;
+            std::wstring validationError;
+            const std::wstring storageValue = SymbolValueForStorage(*mapping, row[column]);
+            if (ValidateSymbolFieldValue(*mapping, storageValue, validationError)) continue;
+            return L"Symbol '" + symbol + L"', field '" + sourceName + L"': " + validationError;
+        }
+    }
+    return {};
+}
+
+bool hasInvalidCellValues() {
+    if (!invalidSymbolCells.empty()) return true;
+    if (cellEditor && hasUncommittedCellEdit()) {
+        std::wstring error;
+        return cellValueError(editingRowIndex, editingColumnIndex, getText(cellEditor), error);
+    }
+    return false;
+}
+
 bool hasPendingSymbolChanges() {
     return importedDataReady || !importedChangedCells.empty() || hasUncommittedCellEdit();
 }
@@ -1009,7 +1113,8 @@ void updateExportButton() {
         EnableWindow(exportButton, !operationRunning.load() && !currentSnapshot.columns.empty());
     }
     if (applyButton) {
-        EnableWindow(applyButton, !operationRunning.load() && hasPendingSymbolChanges());
+        EnableWindow(applyButton, !operationRunning.load() && hasPendingSymbolChanges() &&
+            !hasInvalidCellValues());
     }
     if (browseExcelButton) {
         EnableWindow(browseExcelButton, !operationRunning.load());
@@ -1077,6 +1182,7 @@ void finishCellEdit(bool commit) {
     }
     currentSnapshot.rows[rowIndex][columnIndex] = std::move(normalizedValue);
     importedChangedCells = findImportedChanges(manualEditBaseline, currentSnapshot);
+    updateInvalidCellState(rowIndex, columnIndex);
     refreshVisibleRows();
     updateExportButton();
 
@@ -1085,8 +1191,13 @@ void finishCellEdit(bool commit) {
         (void)symbol;
         changedCells += columns.size();
     }
-    setStatus(L"Manual edit staged. Changed cells: " + std::to_wstring(changedCells) +
-        L". Press Apply Changes to send the values to the selected server.");
+    std::wstring validationError;
+    if (cellValueError(rowIndex, columnIndex, currentSnapshot.rows[rowIndex][columnIndex], validationError)) {
+        setStatus(L"Invalid value. " + validationError + L" The cell is red and Apply Changes is disabled.");
+    } else {
+        setStatus(L"Manual edit staged. Changed cells: " + std::to_wstring(changedCells) +
+            L". Press Apply Changes to send the values to the selected server.");
+    }
 }
 
 void beginCellEdit(int visibleIndex, int columnIndex) {
@@ -1158,6 +1269,7 @@ void clearTable(bool preserveBaseline = false) {
         manualEditBaseline = {};
     }
     importedChangedCells.clear();
+    invalidSymbolCells.clear();
     currentSymbolColumn = (std::numeric_limits<std::size_t>::max)();
     activeSortColumn = -1;
     activeSortAscending = true;
@@ -1636,6 +1748,7 @@ void showImportLoadResult() {
     manualEditBaseline = serverSnapshot.rows.empty() ? currentSnapshot : serverSnapshot;
     currentSymbolColumn = findSymbolColumn(currentSnapshot);
     importedChangedCells = std::move(changedCells);
+    rebuildInvalidCellMap();
     showChangedSymbolsOnly = false;
     if (showChangedSymbolsCheckbox) {
         SendMessageW(showChangedSymbolsCheckbox, BM_SETCHECK, BST_UNCHECKED, 0);
@@ -1653,10 +1766,15 @@ void showImportLoadResult() {
     addTableColumns();
     refreshVisibleRows();
     updateExportButton();
-    setStatus(L"Loaded " + std::to_wstring(currentSnapshot.rows.size()) + L" symbols and " +
+    std::wstring importStatus = L"Loaded " + std::to_wstring(currentSnapshot.rows.size()) + L" symbols and " +
         std::to_wstring(currentSnapshot.columns.size()) + L" parameters from Excel.\r\n" +
         L"Changed cells: " + std::to_wstring(changedCellCount) +
-        L" (light yellow). Press Apply Changes to send these values to the selected server.");
+        L" (light yellow). Invalid cells: " + std::to_wstring(invalidCellCount()) +
+        L" (red). Correct invalid values before applying.";
+    if (invalidCellCount() != 0) {
+        importStatus += L"\r\nFirst invalid value: " + firstInvalidCellMessage();
+    }
+    setStatus(importStatus);
 }
 
 void showAbortPrompt();
@@ -1664,6 +1782,11 @@ void showAbortPrompt();
 void startApplyChanges() {
     if (cellEditor) finishCellEdit(true);
     if (!hasPendingSymbolChanges() || currentSnapshot.rows.empty() || operationRunning.load()) return;
+    if (hasInvalidCellValues()) {
+        const std::wstring message = firstInvalidCellMessage();
+        setStatus(L"Apply Changes is disabled until every invalid cell is corrected. " + message);
+        return;
+    }
     ConnectionProfile profile;
     if (!selectedProfile(profile)) {
         setStatus(L"Select a server profile before applying symbol changes.");
@@ -1827,6 +1950,7 @@ void showApplyResult() {
         serverSnapshot = currentSnapshot;
         manualEditBaseline = currentSnapshot;
         importedChangedCells.clear();
+        invalidSymbolCells.clear();
         importedDataReady = false;
         refreshVisibleRows();
         updateExportButton();
@@ -2283,6 +2407,13 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 }
 
                 const std::wstring_view symbol = rowCellValue(currentSnapshot.rows[rowIndex], currentSymbolColumn);
+                const auto invalidSymbol = invalidSymbolCells.find(std::wstring(symbol));
+                if (invalidSymbol != invalidSymbolCells.end() && invalidSymbol->second.contains(column)) {
+                    draw->clrTextBk = RGB(255, 204, 204);
+                    draw->clrText = GetSysColor(COLOR_WINDOWTEXT);
+                    return CDRF_NEWFONT | (hasDivider ? CDRF_NOTIFYPOSTPAINT : 0);
+                }
+
                 const auto changedSymbol = importedChangedCells.find(std::wstring(symbol));
                 if (changedSymbol != importedChangedCells.end() &&
                     changedSymbol->second.contains(column)) {
