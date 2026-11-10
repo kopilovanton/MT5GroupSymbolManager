@@ -1,22 +1,27 @@
 # MT5 Group Symbol Manager
 
-Connect to an MT5 Manager API profile, choose a client group, and retrieve the
-effective symbol settings for that group. Each row represents a symbol
-available to the selected group. The table displays the configured `symbols.ini`
-fields, including per-order-type margin rates and quote/trade sessions. Columns
-covering values that cannot be overridden at group level are read-only.
+Connect to an MT5 Manager API profile to retrieve the effective symbol settings
+for symbols listed in each server group's `Symbol` rules. Exact symbol paths
+appear directly; wildcard paths expand to their matching server symbols. Each
+row represents one group-symbol pair. The first
+column, `Group Path`, identifies the group and has the same filter as the other
+columns. `Group Path`, `Symbol`, and `Path` remain fixed at the left while the
+rest of the table scrolls. The table displays configured `symbols.ini` fields,
+including per-order-type margin rates and quote/trade sessions. Columns that
+cannot be overridden at group level are read-only.
 
 ## Excel export and import
 
 Use **Export Excel** to save the table as `.xlsx`. Use **Browse...** to load an
 edited workbook into the table. The workbook must keep the exported first
-worksheet and the same unique headings configured in `symbols.ini`; columns
-may be reordered. Once loaded, **Apply Changes** writes changed fields that the
-selected group supports. Unknown symbols are skipped. The app does not create
+worksheet, the generated `Group Path` column, and the same unique headings
+configured in `symbols.ini`; columns may be reordered. Once loaded, **Apply Changes** writes changed fields
+supported at group level. A symbol may appear in more than one group;
+`Group Path` and `Symbol` together identify a row. The app does not create
 symbols or alter global symbol settings.
 
-Before applying, the app saves the current effective values for the selected
-group to a timestamped CSV in the `backup` directory beside the executable.
+Before applying, the app saves the current effective values across all groups
+to a timestamped CSV in the `backup` directory beside the executable.
 Group-specific overrides are saved without changing broader group rules.
 During the update, **Abort** pauses after the current symbol. Confirm stops and
 keeps successful changes; closing the confirmation resumes the update;
@@ -45,6 +50,14 @@ The order of mappings sets the column order in the table and Excel export.
 Remove a mapping line to omit that field. On first launch, the app creates a
 file containing every supported field with its original name as the heading.
 
+`[GroupSymbolFields]` controls the columns for settings stored in each group's
+`Symbol` list. Its order and headings work the same way; `Path` is retained as
+the symbol path, while `Group Path` is always shown first. Blank lines create
+vertical dividers. `[GroupConstraints]` has the same
+`minimum|maximum|maxChars|allowedValues` format for these fields. The SDK-backed
+enum, flag, and integer bounds are prefilled where defined; blank slots are
+templates for limits the SDK does not specify.
+
 Optional `[ValueMap.<SDK field>]` sections map numeric enum values to labels,
 for example `[ValueMap.BookVolumeMode]` with `0=Default`, `1=Amounts`, and
 `2=Lots`. `[FlagMap.<SDK field>]` sections map zero, individual bits, or exact
@@ -52,6 +65,10 @@ combined values. Exact matches take precedence; otherwise known individual bits
 display as labels joined by ` | `. `[TextMap.<SDK field>]`
 sections map text codes to labels; `[TextMap.Country]` contains ISO 3166-1
 alpha-3 codes such as `USA=United States`.
+`[GroupValueMap.<field>]`, `[GroupFlagMap.<field>]`, and
+`[GroupTextMap.<field>]` can override value labels specifically for group
+settings. When no group-specific map is present, matching `ValueMap`, `FlagMap`,
+or `TextMap` entries are reused.
 
 The app keeps unmapped enum codes and unknown flag combinations numeric, and
 passes unknown text values through unchanged. Excel import accepts configured

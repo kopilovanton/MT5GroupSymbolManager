@@ -89,6 +89,9 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
                              std::vector<SymbolFieldMapping>& mappings,
                              bool& created,
                              std::wstring& error);
+bool LoadGroupSymbolFieldMappings(const std::wstring& path,
+                                  std::vector<SymbolFieldMapping>& mappings,
+                                  std::wstring& error);
 
 std::wstring SymbolValueForDisplay(const SymbolFieldMapping& mapping,
                                    const std::wstring& value);
@@ -105,6 +108,21 @@ bool LoadGroupSymbolSnapshot(const std::wstring& server,
                              std::vector<std::wstring>& groupNames,
                              SymbolSnapshot& snapshot,
                              std::wstring& error);
+
+bool LoadGroupListSnapshot(const std::wstring& server,
+                           const std::wstring& loginText,
+                           const std::wstring& password,
+                           std::vector<std::wstring>& groupNames,
+                           SymbolSnapshot& snapshot,
+                           std::wstring& error);
+
+bool LoadGroupSymbolPathsSnapshot(const std::wstring& server,
+                                  const std::wstring& loginText,
+                                  const std::wstring& password,
+                                  const std::vector<SymbolFieldMapping>& fieldMappings,
+                                  std::vector<std::wstring>& groupNames,
+                                  SymbolSnapshot& snapshot,
+                                  std::wstring& error);
 
 bool IsSymbolFieldEditable(const std::wstring& sourceName);
 

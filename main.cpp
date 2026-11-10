@@ -93,6 +93,14 @@ struct FetchResult {
     SymbolSnapshot snapshot;
 };
 
+enum class TemporaryViewMode {
+    GroupSymbolPaths,
+    AllGroupSymbolParameters
+};
+
+// Set to AllGroupSymbolParameters to restore the full symbol-parameter view.
+constexpr TemporaryViewMode temporaryViewMode = TemporaryViewMode::GroupSymbolPaths;
+
 struct ImportLoadResult {
     bool success = false;
     std::wstring error;
@@ -154,6 +162,7 @@ HFONT statusFont = nullptr;
 HFONT tableFont = nullptr;
 std::vector<ConnectionProfile> profiles;
 std::vector<SymbolFieldMapping> symbolFieldMappings;
+std::vector<SymbolFieldMapping> groupSymbolFieldMappings;
 bool symbolFieldConfigReady = false;
 std::wstring symbolFieldConfigError;
 SymbolSnapshot currentSnapshot;
@@ -410,7 +419,7 @@ LRESULT CALLBACK profilePromptProc(HWND window, UINT message, WPARAM wParam, LPA
 
     switch (message) {
     case WM_CREATE:
-        CreateWindowW(L"STATIC", L"Connect using the selected server profile and client group?",
+        CreateWindowW(L"STATIC", L"Connect using the selected server profile?",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE, 18, 18, 405, 38,
             window, nullptr, instanceHandle, nullptr);
         CreateWindowW(L"BUTTON", L"Connect", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
@@ -505,14 +514,22 @@ std::wstring_view rowCellValue(const std::vector<std::wstring>& row, std::size_t
     return column < row.size() ? std::wstring_view(row[column]) : std::wstring_view{};
 }
 
+const SymbolFieldMapping* displayMappingForSource(const std::wstring& sourceName) {
+    if constexpr (temporaryViewMode == TemporaryViewMode::GroupSymbolPaths) {
+        const auto groupMapping = std::find_if(groupSymbolFieldMappings.begin(), groupSymbolFieldMappings.end(),
+            [&sourceName](const SymbolFieldMapping& field) { return field.sourceName == sourceName; });
+        if (groupMapping != groupSymbolFieldMappings.end()) return &*groupMapping;
+    }
+    const auto symbolMapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
+        [&sourceName](const SymbolFieldMapping& field) { return field.sourceName == sourceName; });
+    return symbolMapping == symbolFieldMappings.end() ? nullptr : &*symbolMapping;
+}
+
 void rebuildDisplayRows() {
     currentDisplayRows = currentSnapshot.rows;
     for (std::size_t column = 0; column < currentSnapshot.sourceNames.size(); ++column) {
-        const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
-            [sourceName = currentSnapshot.sourceNames[column]](const SymbolFieldMapping& field) {
-                return field.sourceName == sourceName;
-            });
-        if (mapping == symbolFieldMappings.end()) continue;
+        const SymbolFieldMapping* mapping = displayMappingForSource(currentSnapshot.sourceNames[column]);
+        if (!mapping) continue;
         for (auto& row : currentDisplayRows) {
             if (column < row.size()) row[column] = SymbolValueForDisplay(*mapping, row[column]);
         }
@@ -1152,14 +1169,18 @@ void updateExportButton() {
         EnableWindow(exportButton, !operationRunning.load() && !currentSnapshot.columns.empty());
     }
     if (applyButton) {
-        EnableWindow(applyButton, !operationRunning.load() && hasPendingSymbolChanges() &&
+        EnableWindow(applyButton,
+            temporaryViewMode == TemporaryViewMode::AllGroupSymbolParameters &&
+            !operationRunning.load() && hasPendingSymbolChanges() &&
             !hasInvalidCellValues());
     }
     if (browseExcelButton) {
-        EnableWindow(browseExcelButton, !operationRunning.load());
+        EnableWindow(browseExcelButton,
+            temporaryViewMode == TemporaryViewMode::AllGroupSymbolParameters && !operationRunning.load());
     }
     if (showChangedSymbolsCheckbox) {
-        const bool filterAvailable = importedDataReady || !importedChangedCells.empty();
+        const bool filterAvailable = temporaryViewMode == TemporaryViewMode::AllGroupSymbolParameters &&
+            (importedDataReady || !importedChangedCells.empty());
         if (!filterAvailable && showChangedSymbolsOnly) {
             showChangedSymbolsOnly = false;
             SendMessageW(showChangedSymbolsCheckbox, BM_SETCHECK, BST_UNCHECKED, 0);
@@ -1240,7 +1261,8 @@ void finishCellEdit(bool commit) {
 }
 
 void beginCellEdit(int visibleIndex, int columnIndex) {
-    if (operationRunning.load() || visibleIndex < 0 || columnIndex < 0 || !symbolList) return;
+    if (temporaryViewMode != TemporaryViewMode::AllGroupSymbolParameters ||
+        operationRunning.load() || visibleIndex < 0 || columnIndex < 0 || !symbolList) return;
     if (cellEditor) finishCellEdit(true);
 
     const std::size_t column = static_cast<std::size_t>(columnIndex);
@@ -1354,7 +1376,10 @@ void updateCredentials() {
     SetWindowTextW(loginEdit, profile.login.c_str());
     SetWindowTextW(passwordEdit, profile.password.c_str());
     clearTable();
-    setStatus(L"Selected profile: " + profile.name + L". Press Connect to choose a client group and retrieve its symbol parameters.");
+    const wchar_t* taskDescription = temporaryViewMode == TemporaryViewMode::GroupSymbolPaths
+        ? L". Press Connect to retrieve each group's configured Symbol paths."
+        : L". Press Connect to retrieve effective symbol parameters across all groups.";
+    setStatus(L"Selected profile: " + profile.name + taskDescription);
 }
 
 void addTableColumns() {
@@ -1363,7 +1388,15 @@ void addTableColumns() {
     const std::size_t sourceColumnCount = (std::min)(currentSnapshot.columns.size(),
         currentSnapshot.sourceNames.size());
     for (std::size_t column = 0; column < sourceColumnCount; ++column) {
-        const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
+        auto mapping = std::find_if(groupSymbolFieldMappings.begin(), groupSymbolFieldMappings.end(),
+            [sourceName = currentSnapshot.sourceNames[column]](const SymbolFieldMapping& field) {
+                return field.sourceName == sourceName;
+            });
+        if (mapping != groupSymbolFieldMappings.end()) {
+            dividerBeforeColumns[column] = mapping->dividerBefore;
+            continue;
+        }
+        mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
             [sourceName = currentSnapshot.sourceNames[column]](const SymbolFieldMapping& field) {
                 return field.sourceName == sourceName;
             });
@@ -1373,9 +1406,12 @@ void addTableColumns() {
     }
     pinnedColumnIndices.clear();
     scrollableColumnIndices.clear();
-    for (const std::wstring_view pinnedName : {
-             std::wstring_view(L"GroupPath"), std::wstring_view(L"Symbol"),
-             std::wstring_view(L"Path")}) {
+    std::vector<std::wstring_view> pinnedNames{L"GroupPath"};
+    if (temporaryViewMode == TemporaryViewMode::AllGroupSymbolParameters) {
+        pinnedNames.push_back(L"Symbol");
+        pinnedNames.push_back(L"Path");
+    }
+    for (const std::wstring_view pinnedName : pinnedNames) {
         for (std::size_t index = 0; index < currentSnapshot.sourceNames.size(); ++index) {
             if (currentSnapshot.sourceNames[index] == pinnedName) {
                 pinnedColumnIndices.push_back(index);
@@ -1479,30 +1515,44 @@ void startFetch(bool preserveCurrentData = false) {
 
     if (!preserveCurrentData) clearTable();
     setBusy(true);
-    setStatus((preserveCurrentData ? L"Refreshing symbol parameters from " : L"Connecting to ") +
-        profile.name + L" and retrieving symbols for all client groups...");
+    const wchar_t* retrievalDescription = temporaryViewMode == TemporaryViewMode::GroupSymbolPaths
+        ? L" and retrieving configured Symbol paths for all groups..."
+        : L" and retrieving symbols for all groups...";
+    setStatus((preserveCurrentData ? L"Refreshing data from " : L"Connecting to ") +
+        profile.name + retrievalDescription);
 
     const HWND window = mainWindow;
     const std::shared_ptr<AsyncState> state = asyncState;
     const std::vector<SymbolFieldMapping> fieldMappings = symbolFieldMappings;
+    const std::vector<SymbolFieldMapping> groupFieldMappings = groupSymbolFieldMappings;
     try {
         fetchWorker = std::thread([window, state, profile = std::move(profile),
-                                   fieldMappings]() mutable {
+                                   fieldMappings, groupFieldMappings]() mutable {
         auto result = std::make_unique<FetchResult>();
         result->profile = profile.name;
         result->server = profile.server;
         try {
-            result->success = LoadGroupSymbolSnapshot(profile.server, profile.login,
-                profile.password, fieldMappings, result->groupNames,
-                result->snapshot, result->error);
+            if constexpr (temporaryViewMode == TemporaryViewMode::GroupSymbolPaths) {
+                result->success = LoadGroupSymbolPathsSnapshot(profile.server, profile.login,
+                    profile.password, groupFieldMappings, result->groupNames,
+                    result->snapshot, result->error);
+            } else {
+                result->success = LoadGroupSymbolSnapshot(profile.server, profile.login,
+                    profile.password, fieldMappings, result->groupNames,
+                    result->snapshot, result->error);
+            }
         } catch (const std::exception& exception) {
             result->success = false;
-            result->error = L"Unexpected error while retrieving symbols: ";
+            result->error = temporaryViewMode == TemporaryViewMode::GroupSymbolPaths
+                ? L"Unexpected error while retrieving group Symbol paths: "
+                : L"Unexpected error while retrieving symbols: ";
             const std::string message = exception.what();
             result->error.append(message.begin(), message.end());
         } catch (...) {
             result->success = false;
-            result->error = L"Unexpected error while retrieving symbols.";
+            result->error = temporaryViewMode == TemporaryViewMode::GroupSymbolPaths
+                ? L"Unexpected error while retrieving group Symbol paths."
+                : L"Unexpected error while retrieving symbols.";
         }
 
         {
@@ -1519,7 +1569,9 @@ void startFetch(bool preserveCurrentData = false) {
     } catch (const std::system_error&) {
         operationRunning.store(false);
         setBusy(false);
-        setStatus(L"Cannot start the symbol retrieval worker thread.");
+        setStatus(temporaryViewMode == TemporaryViewMode::GroupSymbolPaths
+            ? L"Cannot start the group Symbol retrieval worker thread."
+            : L"Cannot start the symbol retrieval worker thread.");
     }
 }
 
@@ -1548,26 +1600,51 @@ void showFetchResult() {
     addTableColumns();
     refreshVisibleRows();
     updateExportButton();
+    if constexpr (temporaryViewMode == TemporaryViewMode::GroupSymbolPaths) {
+        const std::wstring firstLine = L"Connected to " + result->profile + L" (" + result->server +
+            L"). Retrieved " + std::to_wstring(currentSnapshot.rows.size()) +
+            L" configured Symbol entries across " + std::to_wstring(result->groupNames.size()) + L" groups.";
+        std::wstring secondLine = L"Group-specific symbol fields: " +
+            std::to_wstring(currentSnapshot.columns.size() > 1 ? currentSnapshot.columns.size() - 1 : 0) +
+            L". Displaying each group's configured values.";
+        if (currentSnapshot.failedSymbols != 0) {
+            secondLine += L" Failed group or symbol records: " +
+                std::to_wstring(currentSnapshot.failedSymbols) + L".";
+        }
+        if (!result->error.empty()) secondLine += L" " + result->error;
+        setStatus(firstLine + L"\r\n" + secondLine);
+    } else {
+        std::unordered_set<std::wstring> groupsWithRows;
+        if (currentGroupPathColumn < currentSnapshot.columns.size()) {
+            for (const auto& row : currentSnapshot.rows) {
+                if (currentGroupPathColumn < row.size() && !row[currentGroupPathColumn].empty()) {
+                    groupsWithRows.insert(row[currentGroupPathColumn]);
+                }
+            }
+        }
 
-    std::wstring firstLine = L"Connected to " + result->profile + L" (" + result->server +
-        L"). Retrieved " + std::to_wstring(currentSnapshot.rows.size()) +
-        L" symbol rows across " + std::to_wstring(result->groupNames.size()) + L" client groups.";
-    std::wstring secondLine = L"Parameters: " + std::to_wstring(currentSnapshot.columns.size()) +
-        L". Double-click editable values; Failed symbol records: " +
-        std::to_wstring(currentSnapshot.failedSymbols) + L".";
-    if (currentSnapshot.failedSymbols != 0) {
-        secondLine += L" The failed records were skipped.";
+        std::wstring firstLine = L"Connected to " + result->profile + L" (" + result->server +
+            L"). Retrieved " + std::to_wstring(currentSnapshot.rows.size()) +
+            L" symbol rows from " + std::to_wstring(groupsWithRows.size()) + L" of " +
+            std::to_wstring(result->groupNames.size()) + L" groups.";
+        std::wstring secondLine = L"Parameters: " + std::to_wstring(currentSnapshot.columns.size()) +
+            L". Double-click editable values; Failed symbol records: " +
+            std::to_wstring(currentSnapshot.failedSymbols) + L".";
+        if (currentSnapshot.failedSymbols != 0) {
+            secondLine += L" The failed records were skipped.";
+        }
+        if (!result->error.empty()) secondLine += L" " + result->error;
+        setStatus(firstLine + L"\r\n" + secondLine);
     }
-    if (!result->error.empty()) secondLine += L" " + result->error;
-    setStatus(firstLine + L"\r\n" + secondLine);
 }
 
 void exportSnapshot() {
     if (currentSnapshot.columns.empty() || operationRunning.load()) return;
 
     std::vector<wchar_t> path(32768, L'\0');
-    static constexpr wchar_t defaultFileName[] = L"MT5Symbols.xlsx";
-    std::copy(std::begin(defaultFileName), std::end(defaultFileName), path.begin());
+    const wchar_t* defaultFileName = temporaryViewMode == TemporaryViewMode::GroupSymbolPaths
+        ? L"MT5GroupSymbolSettings.xlsx" : L"MT5Symbols.xlsx";
+    std::copy(defaultFileName, defaultFileName + wcslen(defaultFileName) + 1, path.begin());
     static constexpr wchar_t filter[] =
         L"Excel Workbook (*.xlsx)\0*.xlsx\0All files (*.*)\0*.*\0\0";
     OPENFILENAMEW dialog{};
@@ -1576,7 +1653,8 @@ void exportSnapshot() {
     dialog.lpstrFilter = filter;
     dialog.lpstrFile = path.data();
     dialog.nMaxFile = static_cast<DWORD>(path.size());
-    dialog.lpstrTitle = L"Export symbol parameters to Excel";
+    dialog.lpstrTitle = temporaryViewMode == TemporaryViewMode::GroupSymbolPaths
+        ? L"Export group Symbol settings to Excel" : L"Export symbol parameters to Excel";
     dialog.lpstrDefExt = L"xlsx";
     dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT |
         OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
@@ -1591,11 +1669,8 @@ void exportSnapshot() {
     UpdateWindow(statusText);
     SymbolSnapshot exportSnapshot = currentSnapshot;
     for (std::size_t column = 0; column < exportSnapshot.sourceNames.size(); ++column) {
-        const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
-            [sourceName = exportSnapshot.sourceNames[column]](const SymbolFieldMapping& field) {
-                return field.sourceName == sourceName;
-            });
-        if (mapping == symbolFieldMappings.end()) continue;
+        const SymbolFieldMapping* mapping = displayMappingForSource(exportSnapshot.sourceNames[column]);
+        if (!mapping) continue;
         for (auto& row : exportSnapshot.rows) {
             if (column < row.size()) row[column] = SymbolValueForDisplay(*mapping, row[column]);
         }
@@ -1634,15 +1709,21 @@ bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
     std::unordered_map<std::wstring, std::size_t> expectedColumns;
     expectedColumns.reserve(mappings.size());
     std::size_t symbolColumn = mappings.size();
+    std::size_t groupPathColumn = mappings.size();
     for (std::size_t index = 0; index < mappings.size(); ++index) {
         if (!expectedColumns.emplace(mappings[index].displayName, index).second) {
             error = L"symbols.ini contains duplicate column headings; make each heading unique before importing.";
             return false;
         }
         if (mappings[index].sourceName == L"Symbol") symbolColumn = index;
+        if (mappings[index].sourceName == L"GroupPath") groupPathColumn = index;
     }
     if (symbolColumn == mappings.size()) {
         error = L"symbols.ini must include the Symbol field before importing a workbook.";
+        return false;
+    }
+    if (groupPathColumn == mappings.size()) {
+        error = L"The table configuration is missing the Group Path field.";
         return false;
     }
     std::vector<std::size_t> inputColumnForMapping(mappings.size(), mappings.size());
@@ -1676,8 +1757,8 @@ bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
         normalized.sourceNames.push_back(mapping.sourceName);
     }
     normalized.rows.reserve(snapshot.rows.size());
-    std::unordered_set<std::wstring> symbols;
-    symbols.reserve(snapshot.rows.size());
+    std::unordered_set<std::wstring> groupSymbols;
+    groupSymbols.reserve(snapshot.rows.size());
     for (const auto& sourceRow : snapshot.rows) {
         if (sourceRow.size() != snapshot.columns.size()) {
             error = L"The workbook contains a row with a different number of columns than its header.";
@@ -1694,8 +1775,14 @@ bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
             error = L"The workbook contains a row with an empty Symbol value.";
             return false;
         }
-        if (!symbols.insert(row[symbolColumn]).second) {
-            error = L"The workbook contains duplicate symbol '" + row[symbolColumn] + L"'.";
+        if (row[groupPathColumn].empty()) {
+            error = L"The workbook contains a row with an empty Group Path value.";
+            return false;
+        }
+        const std::wstring rowKey = row[groupPathColumn] + L"\x1f" + row[symbolColumn];
+        if (!groupSymbols.insert(rowKey).second) {
+            error = L"The workbook contains duplicate Group Path/Symbol row '" +
+                row[groupPathColumn] + L" / " + row[symbolColumn] + L"'.";
             return false;
         }
         normalized.rows.push_back(std::move(row));
@@ -1841,7 +1928,7 @@ void startApplyChanges() {
         return;
     }
     if (currentGroupPathColumn >= currentSnapshot.columns.size() || serverSnapshot.rows.empty()) {
-        setStatus(L"Connect and load client groups before applying symbol changes.");
+        setStatus(L"Connect and load groups before applying symbol changes.");
         return;
     }
     const std::wstring executableDirectory = GetExecutableDirectory();
@@ -1875,7 +1962,7 @@ void startApplyChanges() {
         0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
 
     setBusy(true);
-    setStatus(L"Creating a backup of effective symbol parameters across client groups...");
+    setStatus(L"Creating a backup of effective symbol parameters across groups...");
     const auto state = applyAsyncState;
     const auto control = applyControlState;
     const auto mappings = symbolFieldMappings;
@@ -2630,6 +2717,11 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
     bool symbolConfigCreated = false;
     symbolFieldConfigReady = LoadSymbolFieldMappings(symbolConfigPath, symbolFieldMappings,
         symbolConfigCreated, symbolFieldConfigError);
+    if (symbolFieldConfigReady &&
+        !LoadGroupSymbolFieldMappings(symbolConfigPath, groupSymbolFieldMappings,
+            symbolFieldConfigError)) {
+        symbolFieldConfigReady = false;
+    }
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
@@ -2753,6 +2845,8 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
     }
     EnableWindow(exportButton, FALSE);
     EnableWindow(applyButton, FALSE);
+    EnableWindow(browseExcelButton,
+        temporaryViewMode == TemporaryViewMode::AllGroupSymbolParameters);
     if (statusFont) SendMessageW(statusText, WM_SETFONT, reinterpret_cast<WPARAM>(statusFont), TRUE);
 
     for (std::size_t index = 0; index < profiles.size(); ++index) {

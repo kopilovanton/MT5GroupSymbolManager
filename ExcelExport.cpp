@@ -146,7 +146,7 @@ void appendValueCell(std::string& xml, std::string_view reference,
 
 bool stringField(std::wstring_view sourceName) {
     static constexpr std::wstring_view fields[] = {
-        L"Symbol", L"Path", L"ISIN", L"Description", L"International", L"Basis",
+        L"GroupPath", L"Symbol", L"Path", L"ISIN", L"Description", L"International", L"Basis",
         L"Source", L"Page", L"CurrencyBase", L"CurrencyProfit", L"CurrencyMargin",
         L"Category", L"Exchange", L"CFI", L"Country"
     };

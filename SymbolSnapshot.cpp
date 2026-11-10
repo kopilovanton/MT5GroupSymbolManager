@@ -873,7 +873,7 @@ std::wstring sdkConstraintForField(std::wstring_view sourceName) {
     if (sourceName == L"Industry") return L"|||0,1..14,51..57,101..123,151..162,201..208,251..269,301..311,351..375,401..412,451..462,501..506,551..554";
     if (sourceName == L"CalcMode") return L"|||0..5,32..39,64";
     if (sourceName == L"TradeMode") return L"|||0..4";
-    if (sourceName == L"ExecMode") return L"|||0..3";
+    if (sourceName == L"ExecMode") return L"|||0..5,32..39,64";
     if (sourceName == L"GTCMode") return L"|||0..2";
     if (sourceName == L"FillFlags") return L"0|7||";
     if (sourceName == L"ExpirFlags") return L"0|15||";
@@ -909,6 +909,47 @@ std::wstring sdkConstraintForField(std::wstring_view sourceName) {
     return L"|||";
 }
 
+std::wstring sdkConstraintForGroupField(std::wstring_view sourceName) {
+    if (sourceName == L"Path") return L"|||";
+    if (sourceName == L"SpreadDiff" || sourceName == L"SpreadDiffBalance" ||
+        sourceName == L"StopsLevel" || sourceName == L"FreezeLevel") {
+        return L"-2147483648|2147483647||";
+    }
+    if (sourceName == L"BookDepthLimit" || sourceName == L"SwapYearDays") {
+        return L"0|4294967295||";
+    }
+    return sdkConstraintForField(sourceName);
+}
+
+void writeDefaultGroupSymbolConfig(std::ostream& output,
+                                   const std::vector<SymbolFieldMapping>& groupMappings) {
+    output << "\n# Group.Symbol columns. Order controls the group-settings table and Excel export.\n"
+              "# A blank line between fields draws a vertical divider. Change only the right side to rename a column.\n"
+              "# Path is required and is kept if removed; Group Path is always shown first.\n"
+              "[GroupSymbolFields]\n"
+              "Path=Symbol Path\n";
+    for (const SymbolFieldMapping& mapping : groupMappings) {
+        if (mapping.sourceName != L"Path" &&
+            (mapping.sourceName == L"MarginInitial" || mapping.sourceName == L"SwapMode" ||
+             mapping.sourceName == L"MarginRateLiquidity" || mapping.sourceName == L"SwapYearDays")) {
+            output << '\n';
+        }
+        output << encodeUtf8(mapping.sourceName) << '=' << encodeUtf8(mapping.displayName) << '\n';
+    }
+    output << "\n# Group-symbol constraints: SourceField=minimum|maximum|maxChars|allowedValues.\n"
+              "# Empty slots disable checks. Numeric bounds use the displayed units.\n"
+              "[GroupConstraints]\n"
+              "Path=|||\n";
+    for (const SymbolFieldMapping& mapping : groupMappings) {
+        if (mapping.sourceName == L"Path") continue;
+        output << encodeUtf8(mapping.sourceName) << '=' <<
+            encodeUtf8(sdkConstraintForGroupField(mapping.sourceName)) << '\n';
+    }
+    output << "\n# Group-specific map sections override matching ValueMap./FlagMap. entries above.\n"
+              "# Examples: [GroupValueMap.TradeMode], [GroupFlagMap.FillFlags].\n"
+              "# Map entries use the same code=label format as ValueMap and FlagMap.\n";
+}
+
 std::wstring serverValueForField(const SymbolFieldMapping& mapping,
                                  const std::wstring& value) {
     return SymbolValueForStorage(mapping, value);
@@ -916,6 +957,7 @@ std::wstring serverValueForField(const SymbolFieldMapping& mapping,
 
 bool writeDefaultSymbolMappings(const std::wstring& path,
                                 const std::vector<Property>& properties,
+                                const std::vector<SymbolFieldMapping>& groupMappings,
                                 std::wstring& error) {
     std::ofstream output(path, std::ios::binary);
     if (!output) {
@@ -950,6 +992,7 @@ bool writeDefaultSymbolMappings(const std::wstring& path,
         output << source << '=' << encodeUtf8(sdkConstraintForField(property.name)) << '\n';
     }
     output << '\n' << kDefaultSymbolValueMaps << '\n';
+    writeDefaultGroupSymbolConfig(output, groupMappings);
     output.close();
     if (!output) {
         error = L"Cannot write symbol field configuration: " + path;
@@ -1325,8 +1368,10 @@ std::vector<Property> makeProperties() {
 
 struct GroupProperty {
     std::wstring name;
+    std::function<std::wstring(const IMTConGroupSymbol&)> read;
     std::function<bool(IMTConGroupSymbol&, std::wstring_view,
                        bool&, std::wstring&)> write;
+    SymbolFieldValueKind valueKind = SymbolFieldValueKind::Text;
 };
 
 std::vector<GroupProperty> makeGroupProperties() {
@@ -1339,20 +1384,29 @@ std::vector<GroupProperty> makeGroupProperties() {
 #define WIDEN(value) WIDEN_INNER(value)
 #define ADD_GROUP_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
+        [](const IMTConGroupSymbol& symbol) { return numberText(symbol.name()); }, \
         [](IMTConGroupSymbol& symbol, std::wstring_view text, \
            bool& changed, std::wstring& error) { \
             return writeNumber(text, [&]() { return symbol.name(); }, \
                 [&](auto value) { return symbol.name(value); }, changed, error); \
-        }})
+        }, \
+        numericValueKind<decltype(std::declval<const IMTConGroupSymbol&>().name())>()})
 #define ADD_GROUP_PRECISION8_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
+        [](const IMTConGroupSymbol& symbol) { return precision8NumberText(symbol.name()); }, \
         [](IMTConGroupSymbol& symbol, std::wstring_view text, \
            bool& changed, std::wstring& error) { \
             return writePrecision8Number(text, [&]() { return symbol.name(); }, \
                 [&](auto value) { return symbol.name(value); }, changed, error); \
-        }})
+        }, SymbolFieldValueKind::FloatingPoint})
 #define ADD_GROUP_VOLUME_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
+        [](const IMTConGroupSymbol& symbol) { \
+            const std::uint64_t volumeExt = symbol.name##Ext(); \
+            const std::uint64_t volume = volumeExt != 0 ? volumeExt : \
+                SMTMath::VolumeExtFromVolume(symbol.name()); \
+            return volumeText(volume); \
+        }, \
         [](IMTConGroupSymbol& symbol, std::wstring_view text, \
            bool& changed, std::wstring& error) { \
             return writeVolumeLots(text, \
@@ -1361,7 +1415,7 @@ std::vector<GroupProperty> makeGroupProperties() {
                 [&]() { return symbol.name##Ext(); }, \
                 [&](std::uint64_t value) { return symbol.name##Ext(value); }, \
                 changed, error); \
-        }})
+        }, SymbolFieldValueKind::VolumeLots})
 
     ADD_GROUP_FIELD(TradeMode);
     ADD_GROUP_FIELD(ExecMode);
@@ -1401,21 +1455,27 @@ std::vector<GroupProperty> makeGroupProperties() {
     };
     for (std::uint32_t type = 0; type < std::size(marginRateNames); ++type) {
         properties.push_back({std::wstring(L"MarginRateInitial.") + marginRateNames[type],
+            [type](const IMTConGroupSymbol& symbol) {
+                return precision8NumberText(symbol.MarginRateInitial(type));
+            },
             [type](IMTConGroupSymbol& symbol, std::wstring_view text,
                    bool& changed, std::wstring& error) {
                 return writePrecision8Number(text,
                     [&]() { return symbol.MarginRateInitial(type); },
                     [&](double value) { return symbol.MarginRateInitial(type, value); },
                     changed, error);
-            }});
+            }, SymbolFieldValueKind::FloatingPoint});
         properties.push_back({std::wstring(L"MarginRateMaintenance.") + marginRateNames[type],
+            [type](const IMTConGroupSymbol& symbol) {
+                return precision8NumberText(symbol.MarginRateMaintenance(type));
+            },
             [type](IMTConGroupSymbol& symbol, std::wstring_view text,
                    bool& changed, std::wstring& error) {
                 return writePrecision8Number(text,
                     [&]() { return symbol.MarginRateMaintenance(type); },
                     [&](double value) { return symbol.MarginRateMaintenance(type, value); },
                     changed, error);
-            }});
+            }, SymbolFieldValueKind::FloatingPoint});
     }
 
     ADD_GROUP_PRECISION8_FIELD(MarginRateLiquidity);
@@ -1445,32 +1505,93 @@ std::vector<GroupProperty> makeGroupProperties() {
     return properties;
 }
 
+std::vector<SymbolFieldMapping> defaultGroupSymbolFieldMappings() {
+    std::vector<SymbolFieldMapping> mappings;
+    mappings.push_back({L"Path", L"Symbol Path"});
+    const std::vector<GroupProperty> properties = makeGroupProperties();
+    mappings.reserve(properties.size() + 1);
+    for (const GroupProperty& property : properties) {
+        SymbolFieldMapping mapping{property.name, property.name};
+        mapping.valueKind = property.valueKind;
+        mapping.dividerBefore = property.name == L"MarginInitial" ||
+            property.name == L"SwapMode" || property.name == L"MarginRateLiquidity" ||
+            property.name == L"SwapYearDays";
+        mappings.push_back(std::move(mapping));
+    }
+    return mappings;
+}
+
+bool extractGroupSymbolRules(IMTManagerAPI* admin, const IMTConGroup* group,
+                             std::vector<std::wstring>& rules, std::wstring& error) {
+    rules.clear();
+    IMTConGroupSymbol* rule = admin->GroupSymbolCreate();
+    if (!rule) {
+        error = L"MT5 API could not create a group symbol rule object.";
+        return false;
+    }
+    const std::uint32_t total = group->SymbolTotal();
+    rules.reserve(total);
+    for (std::uint32_t position = 0; position < total; ++position) {
+        const MTAPIRES result = group->SymbolNext(position, rule);
+        if (result != MT_RET_OK) {
+            rule->Release();
+            error = apiError(L"Reading group Symbol rules", result);
+            rules.clear();
+            return false;
+        }
+        const std::wstring path = cleanText(rule->Path());
+        if (!path.empty()) rules.push_back(path);
+    }
+    rule->Release();
+    return true;
+}
+
+bool requestGroupSymbolRules(IMTManagerAPI* admin, const std::wstring& groupName,
+                             std::vector<std::wstring>& rules, std::wstring& error) {
+    IMTConGroup* group = admin->GroupCreate();
+    if (!group) {
+        error = L"MT5 API could not create a group object.";
+        return false;
+    }
+    const MTAPIRES result = admin->GroupRequest(groupName.c_str(), group);
+    if (result != MT_RET_OK) {
+        group->Release();
+        error = L"Requesting group '" + groupName + L"': " + apiError(L"GroupRequest", result);
+        return false;
+    }
+    const bool read = extractGroupSymbolRules(admin, group, rules, error);
+    group->Release();
+    return read;
+}
+
 bool getGroupNames(IMTManagerAPI* admin, std::vector<std::wstring>& names,
                    std::wstring& error) {
     names.clear();
     if (!admin) {
-        error = L"MT5 API returned an empty administrator interface.";
+        error = L"MT5 API returned an empty manager interface.";
         return false;
     }
-    IMTConGroup* group = admin->GroupCreate();
-    if (!group) {
-        error = L"MT5 API could not create a client group object.";
+    IMTConGroupArray* groups = admin->GroupCreateArray();
+    if (!groups) {
+        error = L"MT5 API could not create a group list.";
         return false;
     }
-    const std::uint32_t total = admin->GroupTotal();
+    const MTAPIRES requestResult = admin->GroupRequestArray(L"*", groups);
+    if (requestResult != MT_RET_OK) {
+        groups->Release();
+        error = apiError(L"Requesting groups from server", requestResult);
+        return false;
+    }
+    const std::uint32_t total = groups->Total();
     names.reserve(total);
     for (std::uint32_t position = 0; position < total; ++position) {
-        const MTAPIRES result = admin->GroupNext(position, group);
-        if (result != MT_RET_OK) {
-            group->Release();
-            error = apiError(L"Reading client group list", result);
-            names.clear();
-            return false;
-        }
+        const IMTConGroup* group = groups->Next(position);
+        if (!group) continue;
         const std::wstring name = cleanText(group->Group());
-        if (!name.empty()) names.push_back(name);
+        if (name.empty()) continue;
+        names.push_back(name);
     }
-    group->Release();
+    groups->Release();
     std::sort(names.begin(), names.end(), [](const std::wstring& left, const std::wstring& right) {
         return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_LESS_THAN;
     });
@@ -1478,6 +1599,7 @@ bool getGroupNames(IMTManagerAPI* admin, std::vector<std::wstring>& names,
 }
 
 bool loadGroupSnapshot(IMTManagerAPI* admin, const std::wstring& groupName,
+                       const std::vector<std::wstring>& groupSymbolRules,
                        const std::vector<SymbolFieldMapping>& fieldMappings,
                        SymbolSnapshot& snapshot, std::wstring& error) {
     snapshot = {};
@@ -1488,17 +1610,7 @@ bool loadGroupSnapshot(IMTManagerAPI* admin, const std::wstring& groupName,
         if (symbols) symbols->Release();
         if (symbol) symbol->Release();
         if (session) session->Release();
-        error = L"MT5 API could not create symbol data objects for the selected group.";
-        return false;
-    }
-
-    MTAPIRES result = admin->SymbolRequestArray(L"*", groupName.c_str(), symbols);
-    if (result != MT_RET_OK) {
-        symbols->Release();
-        symbol->Release();
-        session->Release();
-        error = L"Requesting symbols available to group '" + groupName + L"': " +
-            apiError(L"SymbolRequestArray", result);
+        error = L"MT5 API could not create symbol data objects for the group.";
         return false;
     }
 
@@ -1511,34 +1623,60 @@ bool loadGroupSnapshot(IMTManagerAPI* admin, const std::wstring& groupName,
         snapshot.sourceNames.push_back(fieldMappings[index].sourceName);
     }
 
-    const std::uint32_t total = symbols->Total();
-    snapshot.rows.reserve(total);
+    // Query symbols directly for each path configured in this group's Symbol list.
+    // The group argument asks Manager API for that group's effective symbol settings.
+    snapshot.rows.reserve(groupSymbolRules.size());
     std::unordered_set<std::wstring> seen;
-    seen.reserve(total);
-    for (std::uint32_t position = 0; position < total; ++position) {
-        const IMTConSymbol* listedSymbol = symbols->Next(position);
-        if (!listedSymbol) {
+    for (const std::wstring& rule : groupSymbolRules) {
+        MTAPIRES result = symbols->Clear();
+        if (result != MT_RET_OK) {
             ++snapshot.failedSymbols;
             continue;
         }
-        const std::wstring name = cleanText(listedSymbol->Symbol());
-        if (name.empty() || !seen.insert(name).second) continue;
-        result = admin->SymbolGet(name.c_str(), groupName.c_str(), symbol);
+        result = admin->SymbolRequestArray(rule.c_str(), groupName.c_str(), symbols);
         if (result != MT_RET_OK) {
             ++snapshot.failedSymbols;
             continue;
         }
 
-        std::vector<std::wstring> row;
-        row.reserve(properties.size());
-        for (const Property& property : properties) {
-            row.push_back(property.read(*symbol, session));
+        for (std::uint32_t position = 0; position < symbols->Total(); ++position) {
+            const IMTConSymbol* listedSymbol = symbols->Next(position);
+            if (!listedSymbol) {
+                ++snapshot.failedSymbols;
+                continue;
+            }
+            const std::wstring name = cleanText(listedSymbol->Symbol());
+            const std::wstring symbolPath = cleanText(listedSymbol->Path());
+            if (name.empty()) continue;
+
+            // Guard against servers that return broader results than the requested mask.
+            if (!PathMatchSpecW(symbolPath.c_str(), rule.c_str()) &&
+                !PathMatchSpecW(name.c_str(), rule.c_str())) continue;
+
+            const std::wstring identity = symbolPath.empty() ? name : symbolPath;
+            if (!seen.insert(identity).second) continue;
+            result = admin->SymbolGet(name.c_str(), groupName.c_str(), symbol);
+            if (result != MT_RET_OK) {
+                ++snapshot.failedSymbols;
+                continue;
+            }
+
+            std::vector<std::wstring> row;
+            row.reserve(properties.size());
+            for (const Property& property : properties) {
+                row.push_back(property.read(*symbol, session));
+            }
+            snapshot.rows.push_back(std::move(row));
         }
-        snapshot.rows.push_back(std::move(row));
     }
     symbols->Release();
     symbol->Release();
     session->Release();
+    if (snapshot.rows.empty() && snapshot.failedSymbols != 0) {
+        error = L"Manager API could not retrieve symbols for one or more Symbol rules in group '" +
+            groupName + L"'.";
+        return false;
+    }
     return true;
 }
 
@@ -1553,7 +1691,8 @@ public:
     }
 
     bool connect(const std::wstring& server, std::uint64_t login,
-                 const std::wstring& password, std::wstring& error) {
+                 const std::wstring& password, std::wstring& error,
+                 bool synchronizeSymbols = true) {
         MTAPIRES result = factory_.Initialize();
         if (result != MT_RET_OK) {
             error = apiError(L"MT5 API initialization", result);
@@ -1575,9 +1714,26 @@ public:
             return false;
         }
 
-        result = manager_->Connect(server.c_str(), login, password.c_str(), nullptr, 0, 30000);
+        const std::uint64_t pumpMode = IMTManagerAPI::PUMP_MODE_GROUPS |
+            (synchronizeSymbols ? IMTManagerAPI::PUMP_MODE_SYMBOLS : 0);
+        result = manager_->Connect(server.c_str(), login, password.c_str(), nullptr,
+                                   pumpMode, 30000);
         if (result != MT_RET_OK) {
             error = apiError(L"Connecting to MT5 server", result);
+            return false;
+        }
+        const ULONGLONG syncDeadline = GetTickCount64() + 30000;
+        while ((manager_->GroupTotal() == 0 ||
+                (synchronizeSymbols && manager_->SymbolTotal() == 0)) &&
+               GetTickCount64() < syncDeadline) {
+            Sleep(50);
+        }
+        if (synchronizeSymbols && manager_->SymbolTotal() == 0) {
+            error = L"The server connection succeeded, but no symbol configuration data was synchronized.";
+            return false;
+        }
+        if (manager_->GroupTotal() == 0) {
+            error = L"The server connection succeeded, but no group configuration data was synchronized.";
             return false;
         }
         return true;
@@ -1899,6 +2055,8 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
     error.clear();
 
     const std::vector<Property> availableProperties = makeProperties();
+    const std::vector<SymbolFieldMapping> defaultGroupMappings =
+        defaultGroupSymbolFieldMappings();
     std::ifstream input(path, std::ios::binary);
     if (!input) {
         const DWORD attributes = GetFileAttributesW(path.c_str());
@@ -1908,7 +2066,7 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
             error = L"Cannot read symbol field configuration: " + path;
             return false;
         }
-        if (!writeDefaultSymbolMappings(path, availableProperties, error)) return false;
+        if (!writeDefaultSymbolMappings(path, availableProperties, defaultGroupMappings, error)) return false;
         created = true;
         input.clear();
         input.open(path, std::ios::binary);
@@ -1938,7 +2096,7 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
     std::unordered_map<std::wstring,
         std::vector<std::pair<std::wstring, std::wstring>>> parsedTextMappings;
     std::unordered_map<std::wstring, SymbolValueConstraint> parsedConstraints;
-    enum class MappingKind { None, Value, Flag, Text, Constraints };
+    enum class MappingKind { None, Value, Flag, Text, Constraints, Ignore };
     std::wstring activeMapSource;
     MappingKind activeMapKind = MappingKind::None;
     bool seenConstraintsSection = false;
@@ -1956,7 +2114,16 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
             // Comments are accepted in both the column mapping list and map sections.
         } else if (line.front() == L'[' && line.back() == L']') {
             const std::wstring sectionName = trim(line.substr(1, line.size() - 2));
-            if (sectionName == L"Constraints") {
+            constexpr std::wstring_view groupValueMapPrefix = L"GroupValueMap.";
+            constexpr std::wstring_view groupFlagMapPrefix = L"GroupFlagMap.";
+            constexpr std::wstring_view groupTextMapPrefix = L"GroupTextMap.";
+            if (sectionName == L"GroupSymbolFields" || sectionName == L"GroupConstraints" ||
+                sectionName.rfind(groupValueMapPrefix, 0) == 0 ||
+                sectionName.rfind(groupFlagMapPrefix, 0) == 0 ||
+                sectionName.rfind(groupTextMapPrefix, 0) == 0) {
+                activeMapSource.clear();
+                activeMapKind = MappingKind::Ignore;
+            } else if (sectionName == L"Constraints") {
                 if (seenConstraintsSection) {
                     error = L"Duplicate [Constraints] section in " + path;
                     return false;
@@ -2016,6 +2183,8 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
             activeMapSource = std::move(sourceName);
             activeMapKind = mapKind;
             }
+        } else if (activeMapKind == MappingKind::Ignore) {
+            // Group symbol mappings are loaded separately from this file.
         } else if (activeMapKind == MappingKind::Constraints) {
             const std::size_t equals = line.find(L'=');
             if (equals == std::wstring::npos) {
@@ -2158,6 +2327,264 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
     return true;
 }
 
+bool LoadGroupSymbolFieldMappings(const std::wstring& path,
+                                  std::vector<SymbolFieldMapping>& mappings,
+                                  std::wstring& error) {
+    mappings.clear();
+    error.clear();
+
+    const std::vector<GroupProperty> properties = makeGroupProperties();
+    std::vector<SymbolFieldMapping> defaults = defaultGroupSymbolFieldMappings();
+    const auto isKnownField = [&properties](const std::wstring& name) {
+        return name == L"Path" || std::any_of(properties.begin(), properties.end(),
+            [&name](const GroupProperty& property) { return property.name == name; });
+    };
+    const auto appendDefaults = [&]() {
+        std::ifstream existing(path, std::ios::binary);
+        if (!existing) {
+            error = L"Cannot read group symbol field configuration: " + path;
+            return false;
+        }
+        std::string bytes((std::istreambuf_iterator<char>(existing)), std::istreambuf_iterator<char>());
+        std::ofstream output(std::filesystem::path(path), std::ios::binary | std::ios::app);
+        if (!output) {
+            error = L"Cannot add the GroupSymbolFields section to " + path;
+            return false;
+        }
+        if (!bytes.empty() && bytes.back() != '\n') output << '\n';
+        writeDefaultGroupSymbolConfig(output, defaults);
+        output.close();
+        if (!output) {
+            error = L"Failed to append group symbol fields to " + path;
+            return false;
+        }
+        return true;
+    };
+
+    std::ifstream input(std::filesystem::path(path), std::ios::binary);
+    if (!input) {
+        error = L"Cannot read group symbol field configuration: " + path;
+        return false;
+    }
+    std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    if (bytes.size() > 1024 * 1024) {
+        error = L"Symbol field configuration is larger than 1 MiB: " + path;
+        return false;
+    }
+    std::wstring content = decodeUtf8(bytes);
+    if (!bytes.empty() && content.empty()) {
+        error = L"Symbol field configuration is not valid UTF-8: " + path;
+        return false;
+    }
+    if (content.find(L"[GroupSymbolFields]") == std::wstring::npos) {
+        if (!appendDefaults()) return false;
+        std::ifstream updated(std::filesystem::path(path), std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(updated), std::istreambuf_iterator<char>());
+        content = decodeUtf8(bytes);
+    }
+
+    enum class Section { Ignore, Fields, Constraints, Value, Flag, Text,
+                         GroupValue, GroupFlag, GroupText };
+    Section section = Section::Ignore;
+    std::wstring activeSource;
+    bool dividerPending = false;
+    bool sawFields = false;
+    std::size_t lineNumber = 0;
+    std::size_t start = 0;
+    std::unordered_set<std::wstring> seenFields;
+    std::vector<std::wstring> seenDisplayNames;
+    std::unordered_set<std::wstring> seenConstraintFields;
+    std::unordered_set<std::wstring> seenMapSections;
+    std::unordered_map<std::wstring, SymbolValueConstraint> constraints;
+    using MapEntries = std::vector<std::pair<std::wstring, std::wstring>>;
+    std::unordered_map<std::wstring, MapEntries> commonValues, commonFlags, commonTexts;
+    std::unordered_map<std::wstring, MapEntries> groupValues, groupFlags, groupTexts;
+
+    while (start <= content.size()) {
+        ++lineNumber;
+        const std::size_t end = content.find(L'\n', start);
+        const std::wstring line = trim(content.substr(start,
+            end == std::wstring::npos ? std::wstring::npos : end - start));
+        if (line.empty()) {
+            if (section == Section::Fields && !mappings.empty()) dividerPending = true;
+        } else if (line.front() == L'#' || line.front() == L';') {
+            // Comments are allowed between fields and inside map sections.
+        } else if (line.front() == L'[' && line.back() == L']') {
+            const std::wstring name = trim(line.substr(1, line.size() - 2));
+            activeSource.clear();
+            if (name == L"GroupSymbolFields") {
+                section = Section::Fields;
+                sawFields = true;
+            } else if (name == L"GroupConstraints") {
+                section = Section::Constraints;
+            } else {
+                struct Prefix { std::wstring_view text; Section section; bool groupSpecific; };
+                static constexpr Prefix prefixes[] = {
+                    {L"ValueMap.", Section::Value, false},
+                    {L"FlagMap.", Section::Flag, false},
+                    {L"TextMap.", Section::Text, false},
+                    {L"GroupValueMap.", Section::GroupValue, true},
+                    {L"GroupFlagMap.", Section::GroupFlag, true},
+                    {L"GroupTextMap.", Section::GroupText, true}
+                };
+                section = Section::Ignore;
+                for (const Prefix& prefix : prefixes) {
+                    if (name.rfind(prefix.text, 0) != 0 || name.size() <= prefix.text.size()) continue;
+                    const std::wstring requested = trim(name.substr(prefix.text.size()));
+                    if (!isKnownField(requested)) {
+                        if (prefix.groupSpecific) {
+                            error = L"Unknown group-symbol map field '" + requested + L"' on line " +
+                                std::to_wstring(lineNumber) + L" in " + path;
+                            return false;
+                        }
+                        break;
+                    }
+                    const std::wstring key = (prefix.groupSpecific ? L"Group." : L"Common.") + requested;
+                    if (!seenMapSections.insert(key + L"." + std::to_wstring(static_cast<int>(prefix.section))).second) {
+                        error = L"Duplicate group-symbol map section for '" + requested + L"' in " + path;
+                        return false;
+                    }
+                    activeSource = requested;
+                    section = prefix.section;
+                    break;
+                }
+            }
+        } else if (section == Section::Fields) {
+            const std::size_t equals = line.find(L'=');
+            if (equals == std::wstring::npos) {
+                error = L"Expected SourceField=ColumnHeading on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            SymbolFieldMapping mapping;
+            mapping.sourceName = trim(line.substr(0, equals));
+            mapping.displayName = trim(line.substr(equals + 1));
+            mapping.dividerBefore = !mappings.empty() && dividerPending;
+            if (mapping.sourceName.empty() || mapping.displayName.empty() || !isKnownField(mapping.sourceName)) {
+                error = L"Unknown or empty group-symbol field on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            const bool duplicateHeading = equalsIgnoreCase(mapping.displayName, L"Group Path") ||
+                std::any_of(seenDisplayNames.begin(), seenDisplayNames.end(),
+                    [&mapping](const std::wstring& heading) {
+                        return equalsIgnoreCase(heading, mapping.displayName);
+                    });
+            if (duplicateHeading) {
+                error = L"Duplicate group-symbol column heading '" + mapping.displayName +
+                    L"' on line " + std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            if (!seenFields.insert(mapping.sourceName).second) {
+                error = L"Duplicate group-symbol field '" + mapping.sourceName + L"' on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            seenDisplayNames.push_back(mapping.displayName);
+            if (mapping.sourceName == L"Path") {
+                mapping.valueKind = SymbolFieldValueKind::Text;
+            } else {
+                const auto property = std::find_if(properties.begin(), properties.end(),
+                    [&mapping](const GroupProperty& item) { return item.name == mapping.sourceName; });
+                mapping.valueKind = property->valueKind;
+            }
+            mappings.push_back(std::move(mapping));
+            dividerPending = false;
+        } else if (section == Section::Constraints) {
+            const std::size_t equals = line.find(L'=');
+            if (equals == std::wstring::npos) {
+                error = L"Expected SourceField=minimum|maximum|maxChars|allowedValues on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            const std::wstring sourceName = trim(line.substr(0, equals));
+            SymbolValueConstraint constraint;
+            if (!isKnownField(sourceName) ||
+                !parseSymbolValueConstraint(std::wstring_view(line).substr(equals + 1), constraint)) {
+                error = L"Invalid group-symbol constraint for '" + sourceName + L"' on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            if (!seenConstraintFields.insert(sourceName).second) {
+                error = L"Duplicate group-symbol constraint for '" + sourceName + L"' in " + path;
+                return false;
+            }
+            constraints.emplace(sourceName, std::move(constraint));
+        } else if (section == Section::Value || section == Section::Flag || section == Section::Text ||
+                   section == Section::GroupValue || section == Section::GroupFlag || section == Section::GroupText) {
+            const std::size_t equals = line.find(L'=');
+            if (equals == std::wstring::npos) {
+                error = L"Expected code=display label on line " + std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            const std::wstring codeText = trim(line.substr(0, equals));
+            const std::wstring label = trim(line.substr(equals + 1));
+            std::wstring code;
+            const bool isTextMap = section == Section::Text || section == Section::GroupText;
+            if (!(isTextMap ? canonicalAlpha3Code(codeText, code) : canonicalValueCode(codeText, code)) || label.empty()) {
+                error = L"Invalid code or label in group-symbol map on line " +
+                    std::to_wstring(lineNumber) + L" in " + path;
+                return false;
+            }
+            MapEntries* entries = nullptr;
+            switch (section) {
+            case Section::Value: entries = &commonValues[activeSource]; break;
+            case Section::Flag: entries = &commonFlags[activeSource]; break;
+            case Section::Text: entries = &commonTexts[activeSource]; break;
+            case Section::GroupValue: entries = &groupValues[activeSource]; break;
+            case Section::GroupFlag: entries = &groupFlags[activeSource]; break;
+            case Section::GroupText: entries = &groupTexts[activeSource]; break;
+            default: break;
+            }
+            const bool duplicateCode = std::any_of(entries->begin(), entries->end(),
+                [&code](const auto& item) { return item.first == code; });
+            const bool duplicateLabel = std::any_of(entries->begin(), entries->end(),
+                [isTextMap, &label](const auto& item) {
+                    return isTextMap ? equalsIgnoreCase(item.second, label) : item.second == label;
+                });
+            if (duplicateCode || duplicateLabel) {
+                error = L"Duplicate code or label in group-symbol map for '" + activeSource + L"'.";
+                return false;
+            }
+            entries->emplace_back(std::move(code), label);
+        }
+
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+    }
+
+    if (!sawFields || mappings.empty()) {
+        error = L"No [GroupSymbolFields] entries are configured in " + path;
+        return false;
+    }
+    const auto ensurePath = [&mappings, &seenFields]() {
+        if (seenFields.contains(L"Path")) return;
+        SymbolFieldMapping pathMapping{L"Path", L"Symbol Path"};
+        pathMapping.valueKind = SymbolFieldValueKind::Text;
+        mappings.push_back(std::move(pathMapping));
+    };
+    ensurePath();
+
+    const auto mergeMaps = [](const MapEntries& common, const MapEntries& specific) {
+        MapEntries result = common;
+        for (const auto& item : specific) {
+            const auto existing = std::find_if(result.begin(), result.end(),
+                [&item](const auto& candidate) { return candidate.first == item.first; });
+            if (existing == result.end()) result.push_back(item);
+            else existing->second = item.second;
+        }
+        return result;
+    };
+    for (SymbolFieldMapping& mapping : mappings) {
+        const auto constraint = constraints.find(mapping.sourceName);
+        if (constraint != constraints.end()) mapping.constraint = constraint->second;
+        mapping.valueMappings = mergeMaps(commonValues[mapping.sourceName], groupValues[mapping.sourceName]);
+        mapping.flagMappings = mergeMaps(commonFlags[mapping.sourceName], groupFlags[mapping.sourceName]);
+        mapping.textMappings = mergeMaps(commonTexts[mapping.sourceName], groupTexts[mapping.sourceName]);
+    }
+    return true;
+}
+
 bool LoadGroupSymbolSnapshot(const std::wstring& server,
                              const std::wstring& loginText,
                              const std::wstring& password,
@@ -2184,7 +2611,7 @@ bool LoadGroupSymbolSnapshot(const std::wstring& server,
     IMTManagerAPI* admin = connection.manager();
     if (!getGroupNames(admin, groupNames, error)) return false;
     if (groupNames.empty()) {
-        error = L"The connected server does not contain any client groups.";
+        error = L"The server returned no groups. Check whether this account can view group settings.";
         return false;
     }
 
@@ -2199,10 +2626,23 @@ bool LoadGroupSymbolSnapshot(const std::wstring& server,
     }
 
     std::vector<std::wstring> groupErrors;
+    std::size_t groupsWithRules = 0;
+    std::size_t configuredRuleCount = 0;
     for (const std::wstring& groupName : groupNames) {
-        SymbolSnapshot groupSnapshot;
+        // Fetch each group's full configuration only after enumerating group names,
+        // then resolve that group's own Symbol rules against the symbol catalog.
+        std::vector<std::wstring> groupSymbolRules;
         std::wstring groupError;
-        if (!loadGroupSnapshot(admin, groupName, symbolMappings, groupSnapshot, groupError)) {
+        if (!requestGroupSymbolRules(admin, groupName, groupSymbolRules, groupError)) {
+            groupErrors.push_back(groupName + L": " + groupError);
+            continue;
+        }
+        if (!groupSymbolRules.empty()) ++groupsWithRules;
+        configuredRuleCount += groupSymbolRules.size();
+
+        SymbolSnapshot groupSnapshot;
+        if (!loadGroupSnapshot(admin, groupName, groupSymbolRules,
+                               symbolMappings, groupSnapshot, groupError)) {
             groupErrors.push_back(groupName + L": " + groupError);
             continue;
         }
@@ -2225,14 +2665,211 @@ bool LoadGroupSymbolSnapshot(const std::wstring& server,
     }
 
     if (snapshot.rows.empty()) {
-        error = L"No symbols could be retrieved from the configured client groups.";
-        if (!groupErrors.empty()) error += L" First error: " + groupErrors.front();
+        error = L"The Manager API synchronized " + std::to_wstring(admin->SymbolTotal()) +
+            L" global symbols and returned " + std::to_wstring(groupNames.size()) +
+            L" groups. Individual GroupRequest calls returned " + std::to_wstring(configuredRuleCount) +
+            L" Symbol rules across " + std::to_wstring(groupsWithRules) +
+            L" groups, but none matched a symbol path.";
+        IMTConManager* currentManager = admin->ManagerCreate();
+        if (currentManager) {
+            const MTAPIRES managerResult = admin->ManagerCurrent(currentManager);
+            if (managerResult == MT_RET_OK) {
+                const bool isAdministrator = currentManager->Right(IMTConManager::RIGHT_ADMIN) ==
+                    IMTConManager::RIGHT_FLAGS_GRANTED;
+                const bool canConfigureSymbols = currentManager->Right(IMTConManager::RIGHT_CFG_SYMBOLS) ==
+                    IMTConManager::RIGHT_FLAGS_GRANTED;
+                if (!isAdministrator && !canConfigureSymbols) {
+                    error += L" The connected manager login lacks CfgSymbols (Configure Symbols) permission.";
+                } else {
+                    error += L" CfgSymbols permission is present, so check whether symbols are available to these groups.";
+                }
+            }
+            currentManager->Release();
+        }
+        if (snapshot.failedSymbols != 0) {
+            error += L" Symbol retrieval failures: " + std::to_wstring(snapshot.failedSymbols) + L".";
+        }
+        if (!groupErrors.empty()) error += L" First group error: " + groupErrors.front();
+        else if (!groupNames.empty()) {
+            error += L" Groups checked: ";
+            const std::size_t namesToShow = (std::min)(groupNames.size(), std::size_t{5});
+            for (std::size_t index = 0; index < namesToShow; ++index) {
+                if (index != 0) error += L", ";
+                error += groupNames[index];
+            }
+            if (groupNames.size() > namesToShow) error += L", ...";
+        }
         return false;
     }
     snapshot.failedSymbols += static_cast<std::uint32_t>(groupErrors.size());
     if (!groupErrors.empty()) {
-        error = std::to_wstring(groupErrors.size()) + L" client group(s) could not be loaded. " +
+        error = std::to_wstring(groupErrors.size()) + L" group(s) could not be loaded. " +
             L"First error: " + groupErrors.front();
+    }
+    return true;
+}
+
+bool LoadGroupListSnapshot(const std::wstring& server,
+                           const std::wstring& loginText,
+                           const std::wstring& password,
+                           std::vector<std::wstring>& groupNames,
+                           SymbolSnapshot& snapshot,
+                           std::wstring& error) {
+    error.clear();
+    groupNames.clear();
+    snapshot = {};
+
+    std::uint64_t login = 0;
+    if (!parseLogin(loginText, login)) {
+        error = L"Login must contain only digits and be greater than zero.";
+        return false;
+    }
+    if (server.empty() || password.empty()) {
+        error = L"Server and password must not be empty.";
+        return false;
+    }
+
+    ManagerConnection connection;
+    if (!connection.connect(server, login, password, error, false)) return false;
+    if (!getGroupNames(connection.manager(), groupNames, error)) return false;
+    if (groupNames.empty()) {
+        error = L"The server returned no groups. Check whether this account can view group settings.";
+        return false;
+    }
+
+    snapshot.columns.push_back(L"Group Path");
+    snapshot.sourceNames.push_back(L"GroupPath");
+    snapshot.rows.reserve(groupNames.size());
+    for (const std::wstring& groupName : groupNames) {
+        snapshot.rows.push_back({groupName});
+    }
+    return true;
+}
+
+bool LoadGroupSymbolPathsSnapshot(const std::wstring& server,
+                                  const std::wstring& loginText,
+                                  const std::wstring& password,
+                                  const std::vector<SymbolFieldMapping>& fieldMappings,
+                                  std::vector<std::wstring>& groupNames,
+                                  SymbolSnapshot& snapshot,
+                                  std::wstring& error) {
+    error.clear();
+    groupNames.clear();
+    snapshot = {};
+
+    std::uint64_t login = 0;
+    if (!parseLogin(loginText, login)) {
+        error = L"Login must contain only digits and be greater than zero.";
+        return false;
+    }
+    if (server.empty() || password.empty()) {
+        error = L"Server and password must not be empty.";
+        return false;
+    }
+
+    ManagerConnection connection;
+    if (!connection.connect(server, login, password, error, false)) return false;
+    IMTManagerAPI* admin = connection.manager();
+    if (!getGroupNames(admin, groupNames, error)) return false;
+    if (groupNames.empty()) {
+        error = L"The server returned no groups. Check whether this account can view group settings.";
+        return false;
+    }
+
+    IMTConGroup* group = admin->GroupCreate();
+    IMTConGroupSymbol* symbolSetting = admin->GroupSymbolCreate();
+    if (!group || !symbolSetting) {
+        if (group) group->Release();
+        if (symbolSetting) symbolSetting->Release();
+        error = L"MT5 API could not create group symbol configuration objects.";
+        return false;
+    }
+
+    snapshot.columns.push_back(L"Group Path");
+    snapshot.sourceNames.push_back(L"GroupPath");
+    const std::vector<GroupProperty> groupProperties = makeGroupProperties();
+    snapshot.columns.reserve(fieldMappings.size() + 1);
+    snapshot.sourceNames.reserve(fieldMappings.size() + 1);
+    for (const SymbolFieldMapping& mapping : fieldMappings) {
+        snapshot.columns.push_back(mapping.displayName);
+        snapshot.sourceNames.push_back(mapping.sourceName);
+    }
+    std::wstring firstFailure;
+    for (const std::wstring& groupName : groupNames) {
+        MTAPIRES result = admin->GroupRequest(groupName.c_str(), group);
+        if (result != MT_RET_OK) {
+            ++snapshot.failedSymbols;
+            if (firstFailure.empty()) {
+                firstFailure = L"Group '" + groupName + L"': " + apiError(L"GroupRequest", result);
+            }
+            continue;
+        }
+
+        const std::uint32_t total = group->SymbolTotal();
+        snapshot.rows.reserve(snapshot.rows.size() + total);
+        for (std::uint32_t position = 0; position < total; ++position) {
+            result = group->SymbolNext(position, symbolSetting);
+            if (result != MT_RET_OK) {
+                ++snapshot.failedSymbols;
+                if (firstFailure.empty()) {
+                    firstFailure = L"Group '" + groupName + L"': " +
+                        apiError(L"Group.SymbolNext", result);
+                }
+                continue;
+            }
+            const std::wstring configuredPath = cleanText(symbolSetting->Path());
+            if (configuredPath.empty()) {
+                ++snapshot.failedSymbols;
+                if (firstFailure.empty()) {
+                    firstFailure = L"Group '" + groupName + L"' returned an empty Symbol path.";
+                }
+                continue;
+            }
+
+            result = group->SymbolGet(configuredPath.c_str(), symbolSetting);
+            if (result != MT_RET_OK) {
+                ++snapshot.failedSymbols;
+                if (firstFailure.empty()) {
+                    firstFailure = L"Group '" + groupName + L"', path '" + configuredPath +
+                        L"': " + apiError(L"Group.SymbolGet", result);
+                }
+                continue;
+            }
+
+            std::vector<std::wstring> row;
+            row.reserve(1 + fieldMappings.size());
+            row.push_back(groupName);
+            bool rowValid = true;
+            for (const SymbolFieldMapping& mapping : fieldMappings) {
+                std::wstring value;
+                if (mapping.sourceName == L"Path") {
+                    value = configuredPath;
+                } else {
+                    const auto property = std::find_if(groupProperties.begin(), groupProperties.end(),
+                        [&mapping](const GroupProperty& candidate) {
+                            return candidate.name == mapping.sourceName;
+                        });
+                    if (property == groupProperties.end()) {
+                        ++snapshot.failedSymbols;
+                        if (firstFailure.empty()) {
+                            firstFailure = L"Unknown group-symbol field '" + mapping.sourceName + L"'.";
+                        }
+                        rowValid = false;
+                        break;
+                    }
+                    value = property->read(*symbolSetting);
+                }
+                row.push_back(std::move(value));
+            }
+            if (rowValid) snapshot.rows.push_back(std::move(row));
+        }
+    }
+    symbolSetting->Release();
+    group->Release();
+
+    if (snapshot.failedSymbols != 0) {
+        error = L"Could not read " + std::to_wstring(snapshot.failedSymbols) +
+            L" group or Symbol record(s). First failure: " + firstFailure;
     }
     return true;
 }
@@ -2251,7 +2888,7 @@ static bool applyImportedSingleGroupSymbolSnapshot(const std::wstring& server,
     error.clear();
     if (server.empty() || password.empty() || groupName.empty() || fieldMappings.empty() ||
         importedSnapshot.rows.empty() || importedSnapshot.columns.size() != fieldMappings.size()) {
-        error = L"The imported workbook, selected group, or server profile is incomplete.";
+        error = L"The imported workbook or server profile is incomplete.";
         return false;
     }
 
@@ -2315,11 +2952,15 @@ static bool applyImportedSingleGroupSymbolSnapshot(const std::wstring& server,
     // Capture the effective group values before planning any writes. This is also the
     // human-readable backup used by the application's restore workflow.
     SymbolSnapshot backup;
-    if (!loadGroupSnapshot(admin, groupName, fieldMappings, backup, error)) return false;
+    std::vector<std::wstring> groupSymbolRules;
+    if (!requestGroupSymbolRules(admin, groupName, groupSymbolRules, error)) return false;
+    if (!loadGroupSnapshot(admin, groupName, groupSymbolRules,
+                           fieldMappings, backup, error)) return false;
     if (backup.failedSymbols != 0 || backup.rows.empty()) {
         error = backup.rows.empty()
-            ? L"The selected group returned no symbols. No values were applied."
-            : L"Could not retrieve every symbol in the selected group for a complete backup. No values were applied.";
+            ? L"Group '" + groupName + L"' returned no symbols. No values were applied."
+            : L"Could not retrieve every symbol in group '" + groupName +
+                L"' for a complete backup. No values were applied.";
         return false;
     }
 
@@ -2478,7 +3119,7 @@ static bool applyImportedSingleGroupSymbolSnapshot(const std::wstring& server,
                         break;
                     }
                     if (wouldChange) {
-                        error = L"Field '" + sourceName + L"' cannot be overridden for a client group. "
+                        error = L"Field '" + sourceName + L"' cannot be overridden at group level. "
                             L"No values were applied.";
                         preflightFailed = true;
                         break;
@@ -2839,9 +3480,7 @@ bool ApplyImportedGroupSymbolSnapshot(const std::wstring& server,
 
     std::unordered_set<std::wstring> knownGroups;
     std::unordered_map<std::wstring, const std::vector<std::wstring>*> baselineRows;
-    std::unordered_map<std::wstring, std::wstring> groupBySymbol;
     baselineRows.reserve(baselineSnapshot.rows.size());
-    groupBySymbol.reserve(baselineSnapshot.rows.size());
     for (const auto& row : baselineSnapshot.rows) {
         if (groupPathColumn >= row.size() || symbolColumn >= row.size()) continue;
         const std::wstring& groupPath = row[groupPathColumn];
@@ -2849,7 +3488,6 @@ bool ApplyImportedGroupSymbolSnapshot(const std::wstring& server,
         if (groupPath.empty() || symbol.empty()) continue;
         knownGroups.insert(groupPath);
         baselineRows.emplace(compositeKey(row, groupPathColumn, symbolColumn), &row);
-        groupBySymbol.emplace(symbol, groupPath);
     }
     if (knownGroups.empty()) {
         error = L"The current server snapshot has no group paths. No values were applied.";
@@ -2883,10 +3521,9 @@ bool ApplyImportedGroupSymbolSnapshot(const std::wstring& server,
                 groupPath + L" / " + symbol + L"'.";
             return false;
         }
-        const auto priorGroup = groupBySymbol.find(symbol);
-        if (priorGroup != groupBySymbol.end() && priorGroup->second != groupPath &&
-            !baselineRows.contains(key)) {
-            error = L"Group Path cannot be changed for symbol '" + symbol + L"'. No values were applied.";
+        if (!baselineRows.contains(key)) {
+            error = L"Group Path and Symbol must match a row from the current server snapshot ('" +
+                groupPath + L" / " + symbol + L"'). No values were applied.";
             return false;
         }
         for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
@@ -3016,6 +3653,11 @@ bool ApplyImportedGroupSymbolSnapshot(const std::wstring& server,
 
     if (result.restoreRequested && !completedGroups.empty()) {
         std::size_t restoredRows = 0;
+        std::size_t totalRestoreRows = 0;
+        for (const auto& [groupPath, rowIndices] : completedGroups) {
+            (void)groupPath;
+            totalRestoreRows += rowIndices.size();
+        }
         for (std::size_t offset = 0; offset < completedGroups.size(); ++offset) {
             const auto& [groupPath, rowIndices] = completedGroups[completedGroups.size() - 1 - offset];
             std::unordered_set<std::wstring> groupRowKeys;
@@ -3036,10 +3678,14 @@ bool ApplyImportedGroupSymbolSnapshot(const std::wstring& server,
             SymbolSnapshot groupBaseline = makeGroupSnapshot(baselineSnapshot, baselineRowIndices);
             ApplyResult restoreResult;
             std::wstring restoreError;
-            const ApplyCheckpoint restoreCheckpoint = [&](const ApplyProgress& local) {
+            const std::size_t groupRestoreOffset = restoredRows;
+            const ApplyCheckpoint restoreCheckpoint = [&, groupRestoreOffset,
+                                                       groupRowCount = rowIndices.size()](const ApplyProgress& local) {
                 if (!checkpoint) return ApplyChoice::Continue;
-                return checkpoint({restoredRows + local.completed,
-                    (std::max)(completedGroups.size(), std::size_t{1}), true, local.symbol});
+                const std::size_t localRows = local.total == 0 ? 0 :
+                    (std::min)(groupRowCount, local.completed * groupRowCount / local.total);
+                return checkpoint({groupRestoreOffset + localRows,
+                    (std::max)(totalRestoreRows, std::size_t{1}), true, local.symbol});
             };
             if (!groupBaseline.rows.empty() &&
                 applyImportedSingleGroupSymbolSnapshot(server, loginText, password,
