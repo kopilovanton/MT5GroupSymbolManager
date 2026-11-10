@@ -1,25 +1,27 @@
-# MT5 Symbol Manager
+# MT5 Group Symbol Manager
 
-Connect to an MT5 Manager API profile to retrieve symbol configuration and
-display it in a wide, sortable table. Each row represents one symbol. Columns
-cover the `IMTConSymbol` getters, including per-order-type margin rates and
-quote/trade sessions for each weekday. Use the horizontal scrollbar to reach
-the remaining parameters.
+Connect to an MT5 Manager API profile, choose a client group, and retrieve the
+effective symbol settings for that group. Each row represents a symbol
+available to the selected group. The table displays the configured `symbols.ini`
+fields, including per-order-type margin rates and quote/trade sessions. Columns
+covering values that cannot be overridden at group level are read-only.
 
 ## Excel export and import
 
 Use **Export Excel** to save the table as `.xlsx`. Use **Browse...** to load an
 edited workbook into the table. The workbook must keep the exported first
 worksheet and the same unique headings configured in `symbols.ini`; columns
-may be reordered. Once loaded, **Import** applies the values to symbols that
-already exist on the selected server. Unknown symbols are skipped; the app does
-not create symbols.
+may be reordered. Once loaded, **Apply Changes** writes changed fields that the
+selected group supports. Unknown symbols are skipped. The app does not create
+symbols or alter global symbol settings.
 
-Before applying, the app saves all current symbol values to a timestamped CSV
-in the `backup` directory beside the executable. During the update, **Abort**
-pauses after the current symbol. Confirm stops and keeps successful changes;
-closing the confirmation resumes the import; **Confirm and Restore existing
-symbols** restores every symbol touched by that import. The app removes its
+Before applying, the app saves the current effective values for the selected
+group to a timestamped CSV in the `backup` directory beside the executable.
+Group-specific overrides are saved without changing broader group rules.
+During the update, **Abort** pauses after the current symbol. Confirm stops and
+keeps successful changes; closing the confirmation resumes the update;
+**Confirm and Restore existing symbols** restores prior per-symbol group
+overrides and removes overrides created by that update. The app removes its
 backup CSV files when it closes.
 
 ## Connection profiles

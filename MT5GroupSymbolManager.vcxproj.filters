@@ -29,7 +29,7 @@
     <ClInclude Include="resource.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="MT5SymbolManager.rc"><Filter>Resource Files</Filter></ResourceCompile>
-    <None Include="MT5SymbolManager.ico"><Filter>Resource Files</Filter></None>
+    <ResourceCompile Include="MT5GroupSymbolManager.rc"><Filter>Resource Files</Filter></ResourceCompile>
+    <None Include="MT5GroupSymbolManager.ico"><Filter>Resource Files</Filter></None>
   </ItemGroup>
 </Project>

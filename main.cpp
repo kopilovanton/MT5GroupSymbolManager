@@ -42,8 +42,10 @@ constexpr UINT WM_APP_FILTER_COLUMN = WM_APP + 6;
 constexpr UINT WM_APP_SYNC_TABLE_SCROLL = WM_APP + 7;
 constexpr int PINNED_SYMBOL_COLUMN_WIDTH = 100;
 constexpr int PINNED_PATH_COLUMN_WIDTH = 150;
+constexpr int PINNED_GROUP_PATH_COLUMN_WIDTH = 145;
 constexpr int PINNED_SYMBOL_MIN_WIDTH = 20;
 constexpr int PINNED_PATH_MIN_WIDTH = 20;
+constexpr int PINNED_GROUP_PATH_MIN_WIDTH = 40;
 constexpr int TABLE_LEFT = 12;
 constexpr int TABLE_TOP_WIDE = 90;
 constexpr int TABLE_TOP_NARROW = 124;
@@ -52,7 +54,7 @@ constexpr int STATUS_GAP = 6;
 constexpr int TABLE_RIGHT_MARGIN = 4;
 constexpr int TABLE_BOTTOM_MARGIN = 11;
 constexpr int NARROW_LAYOUT_WIDTH = 1150;
-constexpr wchar_t SINGLE_INSTANCE_MUTEX_NAME[] = L"Local\\MT5SymbolManager.SingleInstance";
+constexpr wchar_t SINGLE_INSTANCE_MUTEX_NAME[] = L"Local\\MT5GroupSymbolManager.SingleInstance";
 constexpr int IDC_PROFILE = 1001;
 constexpr int IDC_LOGIN = 1002;
 constexpr int IDC_PASSWORD = 1003;
@@ -77,15 +79,16 @@ constexpr int IDC_FILTER_CLEAR = 1404;
 constexpr int IDC_FILTER_APPLY = 1405;
 constexpr int IDC_FILTER_CANCEL = 1406;
 constexpr int IDC_FILTER_CLEAR_SELECTION = 1407;
-constexpr wchar_t PROFILE_PROMPT_CLASS[] = L"MT5SymbolManagerProfilePrompt";
-constexpr wchar_t APPLY_PROGRESS_CLASS[] = L"MT5SymbolManagerApplyProgress";
-constexpr wchar_t ABORT_PROMPT_CLASS[] = L"MT5SymbolManagerAbortPrompt";
-constexpr wchar_t COLUMN_FILTER_CLASS[] = L"MT5SymbolManagerColumnFilter";
+constexpr wchar_t PROFILE_PROMPT_CLASS[] = L"MT5GroupSymbolManagerProfilePrompt";
+constexpr wchar_t APPLY_PROGRESS_CLASS[] = L"MT5GroupSymbolManagerApplyProgress";
+constexpr wchar_t ABORT_PROMPT_CLASS[] = L"MT5GroupSymbolManagerAbortPrompt";
+constexpr wchar_t COLUMN_FILTER_CLASS[] = L"MT5GroupSymbolManagerColumnFilter";
 
 struct FetchResult {
     bool success = false;
     std::wstring profile;
     std::wstring server;
+    std::vector<std::wstring> groupNames;
     std::wstring error;
     SymbolSnapshot snapshot;
 };
@@ -161,6 +164,7 @@ using ChangedCellMap = std::unordered_map<std::wstring, std::unordered_set<std::
 ChangedCellMap importedChangedCells;
 ChangedCellMap invalidSymbolCells;
 std::size_t currentSymbolColumn = (std::numeric_limits<std::size_t>::max)();
+std::size_t currentGroupPathColumn = (std::numeric_limits<std::size_t>::max)();
 std::shared_ptr<AsyncState> asyncState = std::make_shared<AsyncState>();
 std::shared_ptr<ApplyAsyncState> applyAsyncState = std::make_shared<ApplyAsyncState>();
 std::shared_ptr<ApplyControlState> applyControlState = std::make_shared<ApplyControlState>();
@@ -210,6 +214,7 @@ bool syncingTableScroll = false;
 bool syncingTableSelection = false;
 int pinnedSymbolColumnWidth = PINNED_SYMBOL_COLUMN_WIDTH;
 int pinnedPathColumnWidth = PINNED_PATH_COLUMN_WIDTH;
+int pinnedGroupPathColumnWidth = PINNED_GROUP_PATH_COLUMN_WIDTH;
 void layoutTableForClient(int clientWidth, int clientHeight);
 
 const std::vector<std::size_t>& tableColumnsForView(HWND view) {
@@ -254,6 +259,8 @@ int pinnedColumnsWidth() {
             width += pinnedSymbolColumnWidth;
         } else if (currentSnapshot.sourceNames[column] == L"Path") {
             width += pinnedPathColumnWidth;
+        } else if (currentSnapshot.sourceNames[column] == L"GroupPath") {
+            width += pinnedGroupPathColumnWidth;
         }
     }
     return width;
@@ -273,6 +280,8 @@ void syncPinnedColumnWidthsFromHeader() {
             pinnedSymbolColumnWidth = (std::max)(PINNED_SYMBOL_MIN_WIDTH, item.cxy);
         } else if (currentSnapshot.sourceNames[column] == L"Path") {
             pinnedPathColumnWidth = (std::max)(PINNED_PATH_MIN_WIDTH, item.cxy);
+        } else if (currentSnapshot.sourceNames[column] == L"GroupPath") {
+            pinnedGroupPathColumnWidth = (std::max)(PINNED_GROUP_PATH_MIN_WIDTH, item.cxy);
         }
     }
 }
@@ -286,6 +295,8 @@ void trackPinnedColumnWidth(NMHEADERW& notification) {
         minimumWidth = PINNED_SYMBOL_MIN_WIDTH;
     } else if (currentSnapshot.sourceNames[column] == L"Path") {
         minimumWidth = PINNED_PATH_MIN_WIDTH;
+    } else if (currentSnapshot.sourceNames[column] == L"GroupPath") {
+        minimumWidth = PINNED_GROUP_PATH_MIN_WIDTH;
     } else {
         return;
     }
@@ -293,7 +304,11 @@ void trackPinnedColumnWidth(NMHEADERW& notification) {
     if (currentSnapshot.sourceNames[column] == L"Symbol") {
         pinnedSymbolColumnWidth = notification.pitem->cxy;
     } else {
-        pinnedPathColumnWidth = notification.pitem->cxy;
+        if (currentSnapshot.sourceNames[column] == L"Path") {
+            pinnedPathColumnWidth = notification.pitem->cxy;
+        } else {
+            pinnedGroupPathColumnWidth = notification.pitem->cxy;
+        }
     }
     RECT client{};
     if (mainWindow && GetClientRect(mainWindow, &client)) {
@@ -395,14 +410,14 @@ LRESULT CALLBACK profilePromptProc(HWND window, UINT message, WPARAM wParam, LPA
 
     switch (message) {
     case WM_CREATE:
-        CreateWindowW(L"STATIC", L"Connect to the selected server profile?",
-            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE, 18, 18, 355, 38,
+        CreateWindowW(L"STATIC", L"Connect using the selected server profile and client group?",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_CENTERIMAGE, 18, 18, 405, 38,
             window, nullptr, instanceHandle, nullptr);
         CreateWindowW(L"BUTTON", L"Connect", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            190, 75, 88, 30, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROFILE_PROMPT_CONNECT)),
+            240, 75, 88, 30, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROFILE_PROMPT_CONNECT)),
             instanceHandle, nullptr);
         CreateWindowW(L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            286, 75, 88, 30, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROFILE_PROMPT_CANCEL)),
+            336, 75, 88, 30, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PROFILE_PROMPT_CANCEL)),
             instanceHandle, nullptr);
         setControlTreeFont(window, controlFont);
         return 0;
@@ -431,8 +446,8 @@ LRESULT CALLBACK profilePromptProc(HWND window, UINT message, WPARAM wParam, LPA
 bool confirmProfileConnect() {
     ProfilePromptState state;
     const HWND prompt = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-        PROFILE_PROMPT_CLASS, L"Change server profile",
-        WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 400, 150,
+        PROFILE_PROMPT_CLASS, L"Change connection target",
+        WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 450, 150,
         mainWindow, nullptr, instanceHandle, &state);
     if (!prompt) return false;
 
@@ -524,6 +539,32 @@ std::size_t findSymbolColumn(const SymbolSnapshot& snapshot) {
     return (std::numeric_limits<std::size_t>::max)();
 }
 
+std::size_t findGroupPathColumn(const SymbolSnapshot& snapshot) {
+    for (std::size_t column = 0; column < snapshot.sourceNames.size(); ++column) {
+        if (snapshot.sourceNames[column] == L"GroupPath") return column;
+    }
+    return (std::numeric_limits<std::size_t>::max)();
+}
+
+std::wstring snapshotRowIdentity(const SymbolSnapshot& snapshot,
+                                 const std::vector<std::wstring>& row) {
+    const std::size_t symbolColumn = findSymbolColumn(snapshot);
+    if (symbolColumn >= row.size()) return {};
+    const std::size_t groupPathColumn = findGroupPathColumn(snapshot);
+    if (groupPathColumn < row.size()) {
+        return row[groupPathColumn] + L"\x1f" + row[symbolColumn];
+    }
+    return row[symbolColumn];
+}
+
+std::wstring currentRowIdentity(const std::vector<std::wstring>& row) {
+    if (currentSymbolColumn >= row.size()) return {};
+    if (currentGroupPathColumn < row.size()) {
+        return row[currentGroupPathColumn] + L"\x1f" + row[currentSymbolColumn];
+    }
+    return row[currentSymbolColumn];
+}
+
 std::wstring_view snapshotColumnKey(const SymbolSnapshot& snapshot, std::size_t column) {
     if (column < snapshot.sourceNames.size() && !snapshot.sourceNames[column].empty()) {
         return snapshot.sourceNames[column];
@@ -546,18 +587,16 @@ ChangedCellMap findImportedChanges(const SymbolSnapshot& before,
     ChangedCellMap changedCells;
     if (before.rows.empty() || imported.rows.empty()) return changedCells;
 
-    const std::size_t beforeSymbolColumn = findSymbolColumn(before);
-    const std::size_t importedSymbolColumn = findSymbolColumn(imported);
-    if (beforeSymbolColumn == (std::numeric_limits<std::size_t>::max)() ||
-        importedSymbolColumn == (std::numeric_limits<std::size_t>::max)()) {
+    if (findSymbolColumn(before) == (std::numeric_limits<std::size_t>::max)() ||
+        findSymbolColumn(imported) == (std::numeric_limits<std::size_t>::max)()) {
         return changedCells;
     }
 
     std::unordered_map<std::wstring, const std::vector<std::wstring>*> previousRows;
     previousRows.reserve(before.rows.size());
     for (const auto& row : before.rows) {
-        const std::wstring_view symbol = rowCellValue(row, beforeSymbolColumn);
-        if (!symbol.empty()) previousRows.emplace(std::wstring(symbol), &row);
+        const std::wstring identity = snapshotRowIdentity(before, row);
+        if (!identity.empty()) previousRows.emplace(identity, &row);
     }
 
     std::unordered_map<std::wstring, std::size_t> previousColumns;
@@ -568,21 +607,20 @@ ChangedCellMap findImportedChanges(const SymbolSnapshot& before,
     }
 
     for (const auto& importedRow : imported.rows) {
-        const std::wstring_view symbol = rowCellValue(importedRow, importedSymbolColumn);
-        const auto previousRow = previousRows.find(std::wstring(symbol));
-        if (symbol.empty() || previousRow == previousRows.end()) continue;
+        const std::wstring identity = snapshotRowIdentity(imported, importedRow);
+        const auto previousRow = previousRows.find(identity);
+        if (identity.empty() || previousRow == previousRows.end()) continue;
 
         for (std::size_t importedColumn = 0; importedColumn < imported.columns.size(); ++importedColumn) {
-            if (importedColumn == importedSymbolColumn) continue;
             const std::wstring_view key = snapshotColumnKey(imported, importedColumn);
-            if (key == L"Path") continue;
+            if (key == L"GroupPath" || key == L"Symbol" || key == L"Path") continue;
             const auto previousColumn = previousColumns.find(std::wstring(key));
             if (key.empty() || previousColumn == previousColumns.end()) continue;
 
             const std::wstring_view oldValue = rowCellValue(*previousRow->second, previousColumn->second);
             const std::wstring_view newValue = rowCellValue(importedRow, importedColumn);
             if (!importedValuesEqual(oldValue, newValue)) {
-                changedCells[std::wstring(symbol)].insert(importedColumn);
+                changedCells[identity].insert(importedColumn);
             }
         }
     }
@@ -695,8 +733,8 @@ void refreshVisibleRows() {
     for (std::size_t rowIndex = 0; rowIndex < currentSnapshot.rows.size(); ++rowIndex) {
         const auto& row = currentSnapshot.rows[rowIndex];
         if (showChangedSymbolsOnly) {
-            if (currentSymbolColumn >= row.size()) continue;
-            const auto changedSymbol = importedChangedCells.find(row[currentSymbolColumn]);
+            const std::wstring identity = currentRowIdentity(row);
+            const auto changedSymbol = importedChangedCells.find(identity);
             if (changedSymbol == importedChangedCells.end() || changedSymbol->second.empty()) continue;
         }
         bool matches = true;
@@ -1028,8 +1066,8 @@ void rebuildInvalidCellMap() {
 
     for (std::size_t row = 0; row < currentSnapshot.rows.size(); ++row) {
         if (currentSymbolColumn >= currentSnapshot.rows[row].size()) continue;
-        const std::wstring& symbol = currentSnapshot.rows[row][currentSymbolColumn];
-        if (symbol.empty()) continue;
+        const std::wstring identity = currentRowIdentity(currentSnapshot.rows[row]);
+        if (identity.empty()) continue;
         for (std::size_t column = 0; column < currentSnapshot.sourceNames.size() &&
              column < currentSnapshot.rows[row].size(); ++column) {
             const SymbolFieldMapping* mapping = mappingsByColumn[column];
@@ -1040,7 +1078,7 @@ void rebuildInvalidCellMap() {
             std::wstring validationError;
             const std::wstring storageValue = SymbolValueForStorage(*mapping, currentSnapshot.rows[row][column]);
             if (!ValidateSymbolFieldValue(*mapping, storageValue, validationError)) {
-                invalidSymbolCells[symbol].insert(column);
+                invalidSymbolCells[identity].insert(column);
             }
         }
     }
@@ -1050,15 +1088,16 @@ void updateInvalidCellState(std::size_t rowIndex, std::size_t columnIndex) {
     if (rowIndex >= currentSnapshot.rows.size() ||
         columnIndex >= currentSnapshot.rows[rowIndex].size() ||
         currentSymbolColumn >= currentSnapshot.rows[rowIndex].size()) return;
-    const std::wstring& symbol = currentSnapshot.rows[rowIndex][currentSymbolColumn];
+    const std::wstring identity = currentRowIdentity(currentSnapshot.rows[rowIndex]);
+    if (identity.empty()) return;
     std::wstring error;
     const bool invalid = cellValueError(rowIndex, columnIndex,
         currentSnapshot.rows[rowIndex][columnIndex], error);
     if (invalid) {
-        invalidSymbolCells[symbol].insert(columnIndex);
+        invalidSymbolCells[identity].insert(columnIndex);
         return;
     }
-    const auto existing = invalidSymbolCells.find(symbol);
+    const auto existing = invalidSymbolCells.find(identity);
     if (existing == invalidSymbolCells.end()) return;
     existing->second.erase(columnIndex);
     if (existing->second.empty()) invalidSymbolCells.erase(existing);
@@ -1078,7 +1117,7 @@ std::wstring firstInvalidCellMessage() {
     for (const auto& row : currentSnapshot.rows) {
         if (currentSymbolColumn >= row.size()) continue;
         const std::wstring& symbol = row[currentSymbolColumn];
-        const auto invalid = invalidSymbolCells.find(symbol);
+        const auto invalid = invalidSymbolCells.find(currentRowIdentity(row));
         if (invalid == invalidSymbolCells.end()) continue;
         for (const std::size_t column : invalid->second) {
             if (column >= currentSnapshot.sourceNames.size() || column >= row.size()) continue;
@@ -1271,6 +1310,7 @@ void clearTable(bool preserveBaseline = false) {
     importedChangedCells.clear();
     invalidSymbolCells.clear();
     currentSymbolColumn = (std::numeric_limits<std::size_t>::max)();
+    currentGroupPathColumn = (std::numeric_limits<std::size_t>::max)();
     activeSortColumn = -1;
     activeSortAscending = true;
     columnFilters.clear();
@@ -1314,7 +1354,7 @@ void updateCredentials() {
     SetWindowTextW(loginEdit, profile.login.c_str());
     SetWindowTextW(passwordEdit, profile.password.c_str());
     clearTable();
-    setStatus(L"Selected profile: " + profile.name + L". Press Connect to retrieve symbol parameters.");
+    setStatus(L"Selected profile: " + profile.name + L". Press Connect to choose a client group and retrieve its symbol parameters.");
 }
 
 void addTableColumns() {
@@ -1333,7 +1373,9 @@ void addTableColumns() {
     }
     pinnedColumnIndices.clear();
     scrollableColumnIndices.clear();
-    for (const std::wstring_view pinnedName : {std::wstring_view(L"Symbol"), std::wstring_view(L"Path")}) {
+    for (const std::wstring_view pinnedName : {
+             std::wstring_view(L"GroupPath"), std::wstring_view(L"Symbol"),
+             std::wstring_view(L"Path")}) {
         for (std::size_t index = 0; index < currentSnapshot.sourceNames.size(); ++index) {
             if (currentSnapshot.sourceNames[index] == pinnedName) {
                 pinnedColumnIndices.push_back(index);
@@ -1367,8 +1409,9 @@ void addTableColumns() {
 
     for (std::size_t localIndex = 0; localIndex < pinnedColumnIndices.size(); ++localIndex) {
         const std::size_t snapshotIndex = pinnedColumnIndices[localIndex];
-        const bool isPath = currentSnapshot.sourceNames[snapshotIndex] == L"Path";
-        const int width = isPath ? pinnedPathColumnWidth : pinnedSymbolColumnWidth;
+        const std::wstring& sourceName = currentSnapshot.sourceNames[snapshotIndex];
+        const int width = sourceName == L"GroupPath" ? pinnedGroupPathColumnWidth
+            : sourceName == L"Path" ? pinnedPathColumnWidth : pinnedSymbolColumnWidth;
         insertColumn(pinnedSymbolList, localIndex, snapshotIndex, width);
     }
     for (std::size_t localIndex = 0; localIndex < scrollableColumnIndices.size(); ++localIndex) {
@@ -1437,7 +1480,7 @@ void startFetch(bool preserveCurrentData = false) {
     if (!preserveCurrentData) clearTable();
     setBusy(true);
     setStatus((preserveCurrentData ? L"Refreshing symbol parameters from " : L"Connecting to ") +
-        profile.name + L" and retrieving symbol parameters...");
+        profile.name + L" and retrieving symbols for all client groups...");
 
     const HWND window = mainWindow;
     const std::shared_ptr<AsyncState> state = asyncState;
@@ -1449,8 +1492,9 @@ void startFetch(bool preserveCurrentData = false) {
         result->profile = profile.name;
         result->server = profile.server;
         try {
-            result->success = LoadSymbolSnapshot(profile.server, profile.login, profile.password,
-                                                  fieldMappings, result->snapshot, result->error);
+            result->success = LoadGroupSymbolSnapshot(profile.server, profile.login,
+                profile.password, fieldMappings, result->groupNames,
+                result->snapshot, result->error);
         } catch (const std::exception& exception) {
             result->success = false;
             result->error = L"Unexpected error while retrieving symbols: ";
@@ -1500,18 +1544,21 @@ void showFetchResult() {
     manualEditBaseline = currentSnapshot;
     importedChangedCells.clear();
     currentSymbolColumn = findSymbolColumn(currentSnapshot);
+    currentGroupPathColumn = findGroupPathColumn(currentSnapshot);
     addTableColumns();
     refreshVisibleRows();
     updateExportButton();
 
     std::wstring firstLine = L"Connected to " + result->profile + L" (" + result->server +
-        L"). Retrieved parameters for " + std::to_wstring(currentSnapshot.rows.size()) + L" symbols.";
+        L"). Retrieved " + std::to_wstring(currentSnapshot.rows.size()) +
+        L" symbol rows across " + std::to_wstring(result->groupNames.size()) + L" client groups.";
     std::wstring secondLine = L"Parameters: " + std::to_wstring(currentSnapshot.columns.size()) +
         L". Double-click editable values; Failed symbol records: " +
         std::to_wstring(currentSnapshot.failedSymbols) + L".";
     if (currentSnapshot.failedSymbols != 0) {
         secondLine += L" The failed records were skipped.";
     }
+    if (!result->error.empty()) secondLine += L" " + result->error;
     setStatus(firstLine + L"\r\n" + secondLine);
 }
 
@@ -1747,6 +1794,7 @@ void showImportLoadResult() {
     currentSnapshot = std::move(result->snapshot);
     manualEditBaseline = serverSnapshot.rows.empty() ? currentSnapshot : serverSnapshot;
     currentSymbolColumn = findSymbolColumn(currentSnapshot);
+    currentGroupPathColumn = findGroupPathColumn(currentSnapshot);
     importedChangedCells = std::move(changedCells);
     rebuildInvalidCellMap();
     showChangedSymbolsOnly = false;
@@ -1792,6 +1840,10 @@ void startApplyChanges() {
         setStatus(L"Select a server profile before applying symbol changes.");
         return;
     }
+    if (currentGroupPathColumn >= currentSnapshot.columns.size() || serverSnapshot.rows.empty()) {
+        setStatus(L"Connect and load client groups before applying symbol changes.");
+        return;
+    }
     const std::wstring executableDirectory = GetExecutableDirectory();
     if (executableDirectory.empty()) {
         setStatus(L"Cannot locate the application directory for the symbol backup.");
@@ -1823,15 +1875,16 @@ void startApplyChanges() {
         0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
 
     setBusy(true);
-    setStatus(L"Creating a full backup of current server symbol parameters...");
+    setStatus(L"Creating a backup of effective symbol parameters across client groups...");
     const auto state = applyAsyncState;
     const auto control = applyControlState;
     const auto mappings = symbolFieldMappings;
     const auto imported = currentSnapshot;
+    const auto baseline = serverSnapshot;
     const std::wstring backupDirectory = executableDirectory + L"\\backup";
     try {
         applyWorker = std::thread([window = mainWindow, state, control, profile = std::move(profile),
-                                   mappings, imported, backupDirectory]() mutable {
+                                   mappings, baseline, imported, backupDirectory]() mutable {
             auto result = std::make_unique<ApplyWorkerResult>();
             try {
                 const ApplyCheckpoint checkpoint = [window, control](const ApplyProgress& progress) {
@@ -1853,9 +1906,9 @@ void startApplyChanges() {
                     }
                     return choice;
                 };
-                result->success = ApplyImportedSymbolSnapshot(profile.server, profile.login,
-                    profile.password, mappings, imported, backupDirectory, checkpoint,
-                    result->result, result->error);
+                result->success = ApplyImportedGroupSymbolSnapshot(profile.server,
+                    profile.login, profile.password, mappings, baseline, imported,
+                    backupDirectory, checkpoint, result->result, result->error);
             } catch (const std::exception& exception) {
                 result->success = false;
                 result->error = L"Unexpected error while applying symbol changes: ";
@@ -1925,7 +1978,7 @@ void showApplyResult() {
     if (!result->result.backupPath.empty()) generatedBackupPaths.push_back(result->result.backupPath);
     if (!result->success) {
         setStatus(result->error);
-        MessageBoxW(mainWindow, result->error.c_str(), L"Symbol update failed", MB_OK | MB_ICONERROR);
+        MessageBoxW(mainWindow, result->error.c_str(), L"Group symbol update failed", MB_OK | MB_ICONERROR);
         return;
     }
 
@@ -1955,7 +2008,7 @@ void showApplyResult() {
         refreshVisibleRows();
         updateExportButton();
     }
-    MessageBoxW(mainWindow, summary.c_str(), L"Symbol update result", MB_OK |
+    MessageBoxW(mainWindow, summary.c_str(), L"Group symbol update result", MB_OK |
         ((applied.aborted || applied.failed || applied.skipped || applied.restoreFailed)
             ? MB_ICONWARNING : MB_ICONINFORMATION));
     if (completedWithoutErrors) startFetch(true);
@@ -2125,11 +2178,9 @@ void layoutResizableWindow(HWND window) {
         if (profileCombo) MoveWindow(profileCombo, serverX, firstRowY,
             serverWidth, 220, TRUE);
         if (loginLabel) MoveWindow(loginLabel, loginLabelX, firstRowY, 50, 30, TRUE);
-        if (loginEdit) MoveWindow(loginEdit, loginEditX, firstRowY,
-            loginWidth, 30, TRUE);
+        if (loginEdit) MoveWindow(loginEdit, loginEditX, firstRowY, loginWidth, 30, TRUE);
         if (passwordLabel) MoveWindow(passwordLabel, passwordLabelX, firstRowY, 75, 30, TRUE);
-        if (passwordEdit) MoveWindow(passwordEdit, passwordEditX, firstRowY,
-            passwordWidth, 30, TRUE);
+        if (passwordEdit) MoveWindow(passwordEdit, passwordEditX, firstRowY, passwordWidth, 30, TRUE);
 
         const int buttonGap = 8;
         const int buttonSpace = (std::max)(0, clientWidth - 24 - 2 * buttonGap);
@@ -2181,17 +2232,12 @@ void layoutResizableWindow(HWND window) {
         if (profileCombo) MoveWindow(profileCombo, 70, firstRowY,
             serverWidth, 220, TRUE);
         if (loginLabel) MoveWindow(loginLabel, loginLabelX, firstRowY, 50, 30, TRUE);
-        if (loginEdit) MoveWindow(loginEdit, loginEditX, firstRowY,
-            loginWidth, 30, TRUE);
+        if (loginEdit) MoveWindow(loginEdit, loginEditX, firstRowY, loginWidth, 30, TRUE);
         if (passwordLabel) MoveWindow(passwordLabel, passwordLabelX, firstRowY, 75, 30, TRUE);
-        if (passwordEdit) MoveWindow(passwordEdit, passwordEditX, firstRowY,
-            passwordWidth, 30, TRUE);
-        if (applyButton) MoveWindow(applyButton, applyX, firstRowY,
-            applyWidth, 30, TRUE);
-        if (exportButton) MoveWindow(exportButton, exportX, firstRowY,
-            exportWidth, 30, TRUE);
-        if (connectButton) MoveWindow(connectButton, connectX, firstRowY,
-            connectWidth, 30, TRUE);
+        if (passwordEdit) MoveWindow(passwordEdit, passwordEditX, firstRowY, passwordWidth, 30, TRUE);
+        if (applyButton) MoveWindow(applyButton, applyX, firstRowY, applyWidth, 30, TRUE);
+        if (exportButton) MoveWindow(exportButton, exportX, firstRowY, exportWidth, 30, TRUE);
+        if (connectButton) MoveWindow(connectButton, connectX, firstRowY, connectWidth, 30, TRUE);
 
         const int widthDelta = clientWidth - 1344;
         const int excelWidth = 890 + widthDelta * 80 / 100;
@@ -2406,15 +2452,15 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                     return hasDivider ? CDRF_NOTIFYPOSTPAINT : CDRF_DODEFAULT;
                 }
 
-                const std::wstring_view symbol = rowCellValue(currentSnapshot.rows[rowIndex], currentSymbolColumn);
-                const auto invalidSymbol = invalidSymbolCells.find(std::wstring(symbol));
+                const std::wstring identity = currentRowIdentity(currentSnapshot.rows[rowIndex]);
+                const auto invalidSymbol = invalidSymbolCells.find(identity);
                 if (invalidSymbol != invalidSymbolCells.end() && invalidSymbol->second.contains(column)) {
                     draw->clrTextBk = RGB(255, 204, 204);
                     draw->clrText = GetSysColor(COLOR_WINDOWTEXT);
                     return CDRF_NEWFONT | (hasDivider ? CDRF_NOTIFYPOSTPAINT : 0);
                 }
 
-                const auto changedSymbol = importedChangedCells.find(std::wstring(symbol));
+                const auto changedSymbol = importedChangedCells.find(identity);
                 if (changedSymbol != importedChangedCells.end() &&
                     changedSymbol->second.contains(column)) {
                     const COLORREF highlightColor = RGB(255, 255, 204);
@@ -2549,19 +2595,19 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
                     _In_ LPWSTR, _In_ int showCommand) {
     HANDLE singleInstanceMutex = CreateMutexW(nullptr, TRUE, SINGLE_INSTANCE_MUTEX_NAME);
     if (!singleInstanceMutex) {
-        MessageBoxW(nullptr, L"Unable to check whether MT5 Symbol Manager is already running.",
-            L"MT5 Symbol Manager", MB_OK | MB_ICONERROR);
+        MessageBoxW(nullptr, L"Unable to check whether MT5 Group Symbol Manager is already running.",
+            L"MT5 Group Symbol Manager", MB_OK | MB_ICONERROR);
         return 1;
     }
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        HWND existingWindow = FindWindowW(L"MT5SymbolManagerMainWindow", nullptr);
+        HWND existingWindow = FindWindowW(L"MT5GroupSymbolManagerMainWindow", nullptr);
         if (existingWindow) {
             if (IsIconic(existingWindow)) ShowWindow(existingWindow, SW_RESTORE);
             else ShowWindow(existingWindow, SW_SHOW);
             SetForegroundWindow(existingWindow);
         } else {
-            MessageBoxW(nullptr, L"MT5 Symbol Manager is already running.",
-                L"MT5 Symbol Manager", MB_OK | MB_ICONINFORMATION);
+            MessageBoxW(nullptr, L"MT5 Group Symbol Manager is already running.",
+                L"MT5 Group Symbol Manager", MB_OK | MB_ICONINFORMATION);
         }
         CloseHandle(singleInstanceMutex);
         return 0;
@@ -2589,7 +2635,7 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
     windowClass.cbSize = sizeof(windowClass);
     windowClass.hInstance = instance;
     windowClass.lpfnWndProc = windowProc;
-    windowClass.lpszClassName = L"MT5SymbolManagerMainWindow";
+    windowClass.lpszClassName = L"MT5GroupSymbolManagerMainWindow";
     windowClass.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_APP_ICON));
     windowClass.hIconSm = windowClass.hIcon;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
@@ -2623,7 +2669,7 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
     abortClass.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
     if (!RegisterClassExW(&abortClass)) return 1;
 
-    mainWindow = CreateWindowExW(0, windowClass.lpszClassName, L"MT5 Symbol Manager",
+    mainWindow = CreateWindowExW(0, windowClass.lpszClassName, L"MT5 Group Symbol Manager",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX |
             WS_MAXIMIZEBOX | WS_THICKFRAME,
         CW_USEDEFAULT, CW_USEDEFAULT, 1360, 800, nullptr, nullptr, instance, nullptr);

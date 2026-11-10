@@ -67,7 +67,7 @@ bool LoadConnectionProfiles(const std::wstring& path,
             error = L"Cannot create connection profile file: " + path;
             return false;
         }
-        output << "# MT5 Symbol Manager connection profiles.\n"
+        output << "# MT5 Group Symbol Manager connection profiles.\n"
                   "# Add one section per server. Passwords are stored as plain text.\n"
                   "[Example MT5 server]\n"
                   "server=server:443\n"

@@ -98,21 +98,23 @@ bool ValidateSymbolFieldValue(const SymbolFieldMapping& mapping,
                               std::wstring_view value,
                               std::wstring& error);
 
-bool LoadSymbolSnapshot(const std::wstring& server,
-                        const std::wstring& loginText,
-                        const std::wstring& password,
-                        const std::vector<SymbolFieldMapping>& fieldMappings,
-                        SymbolSnapshot& snapshot,
-                        std::wstring& error);
+bool LoadGroupSymbolSnapshot(const std::wstring& server,
+                             const std::wstring& loginText,
+                             const std::wstring& password,
+                             const std::vector<SymbolFieldMapping>& fieldMappings,
+                             std::vector<std::wstring>& groupNames,
+                             SymbolSnapshot& snapshot,
+                             std::wstring& error);
 
 bool IsSymbolFieldEditable(const std::wstring& sourceName);
 
-bool ApplyImportedSymbolSnapshot(const std::wstring& server,
-                                 const std::wstring& loginText,
-                                 const std::wstring& password,
-                                 const std::vector<SymbolFieldMapping>& fieldMappings,
-                                 const SymbolSnapshot& importedSnapshot,
-                                 const std::wstring& backupDirectory,
-                                 const ApplyCheckpoint& checkpoint,
-                                 ApplyResult& result,
-                                 std::wstring& error);
+bool ApplyImportedGroupSymbolSnapshot(const std::wstring& server,
+                                      const std::wstring& loginText,
+                                      const std::wstring& password,
+                                      const std::vector<SymbolFieldMapping>& fieldMappings,
+                                      const SymbolSnapshot& baselineSnapshot,
+                                      const SymbolSnapshot& importedSnapshot,
+                                      const std::wstring& backupDirectory,
+                                      const ApplyCheckpoint& checkpoint,
+                                      ApplyResult& result,
+                                      std::wstring& error);

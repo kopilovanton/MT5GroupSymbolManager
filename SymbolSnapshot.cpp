@@ -2,6 +2,7 @@
 #include "SymbolValueMapDefaults.h"
 
 #include <windows.h>
+#include <shlwapi.h>
 #pragma warning(push)
 #pragma warning(disable: 4100)
 #include <MT5APIManager.h>
@@ -922,7 +923,7 @@ bool writeDefaultSymbolMappings(const std::wstring& path,
         return false;
     }
 
-    output << "# MT5 Symbol Manager field mappings.\n"
+    output << "# MT5 Group Symbol Manager field mappings.\n"
               "# Format: SDK field name=column heading. The line order sets the table and export order.\n"
               "# A blank line between groups draws a vertical divider before the next column.\n"
               "# Remove a line to omit that field. Keep each source field name unchanged.\n";
@@ -1322,12 +1323,231 @@ std::vector<Property> makeProperties() {
     return properties;
 }
 
+struct GroupProperty {
+    std::wstring name;
+    std::function<bool(IMTConGroupSymbol&, std::wstring_view,
+                       bool&, std::wstring&)> write;
+};
+
+std::vector<GroupProperty> makeGroupProperties() {
+    std::vector<GroupProperty> properties;
+    properties.reserve(64);
+
+#define STRINGIFY_INNER(value) #value
+#define STRINGIFY(value) STRINGIFY_INNER(value)
+#define WIDEN_INNER(value) L##value
+#define WIDEN(value) WIDEN_INNER(value)
+#define ADD_GROUP_FIELD(name) \
+    properties.push_back({WIDEN(STRINGIFY(name)), \
+        [](IMTConGroupSymbol& symbol, std::wstring_view text, \
+           bool& changed, std::wstring& error) { \
+            return writeNumber(text, [&]() { return symbol.name(); }, \
+                [&](auto value) { return symbol.name(value); }, changed, error); \
+        }})
+#define ADD_GROUP_PRECISION8_FIELD(name) \
+    properties.push_back({WIDEN(STRINGIFY(name)), \
+        [](IMTConGroupSymbol& symbol, std::wstring_view text, \
+           bool& changed, std::wstring& error) { \
+            return writePrecision8Number(text, [&]() { return symbol.name(); }, \
+                [&](auto value) { return symbol.name(value); }, changed, error); \
+        }})
+#define ADD_GROUP_VOLUME_FIELD(name) \
+    properties.push_back({WIDEN(STRINGIFY(name)), \
+        [](IMTConGroupSymbol& symbol, std::wstring_view text, \
+           bool& changed, std::wstring& error) { \
+            return writeVolumeLots(text, \
+                [&]() { return symbol.name(); }, \
+                [&](std::uint64_t value) { return symbol.name(value); }, \
+                [&]() { return symbol.name##Ext(); }, \
+                [&](std::uint64_t value) { return symbol.name##Ext(value); }, \
+                changed, error); \
+        }})
+
+    ADD_GROUP_FIELD(TradeMode);
+    ADD_GROUP_FIELD(ExecMode);
+    ADD_GROUP_FIELD(FillFlags);
+    ADD_GROUP_FIELD(ExpirFlags);
+    ADD_GROUP_FIELD(SpreadDiff);
+    ADD_GROUP_FIELD(SpreadDiffBalance);
+    ADD_GROUP_FIELD(StopsLevel);
+    ADD_GROUP_FIELD(FreezeLevel);
+    ADD_GROUP_VOLUME_FIELD(VolumeMin);
+    ADD_GROUP_VOLUME_FIELD(VolumeMax);
+    ADD_GROUP_VOLUME_FIELD(VolumeStep);
+    ADD_GROUP_VOLUME_FIELD(VolumeLimit);
+    ADD_GROUP_FIELD(MarginFlags);
+    ADD_GROUP_PRECISION8_FIELD(MarginInitial);
+    ADD_GROUP_PRECISION8_FIELD(MarginMaintenance);
+    ADD_GROUP_PRECISION8_FIELD(MarginLong);
+    ADD_GROUP_PRECISION8_FIELD(MarginShort);
+    ADD_GROUP_PRECISION8_FIELD(MarginLimit);
+    ADD_GROUP_PRECISION8_FIELD(MarginStop);
+    ADD_GROUP_PRECISION8_FIELD(MarginStopLimit);
+    ADD_GROUP_FIELD(SwapMode);
+    ADD_GROUP_PRECISION8_FIELD(SwapLong);
+    ADD_GROUP_PRECISION8_FIELD(SwapShort);
+    ADD_GROUP_FIELD(Swap3Day);
+    ADD_GROUP_FIELD(RETimeout);
+    ADD_GROUP_FIELD(IECheckMode);
+    ADD_GROUP_FIELD(IETimeout);
+    ADD_GROUP_FIELD(IESlipProfit);
+    ADD_GROUP_FIELD(IESlipLosing);
+    ADD_GROUP_VOLUME_FIELD(IEVolumeMax);
+    ADD_GROUP_FIELD(OrderFlags);
+
+    static constexpr const wchar_t* marginRateNames[] = {
+        L"Buy", L"Sell", L"BuyLimit", L"SellLimit",
+        L"BuyStop", L"SellStop", L"BuyStopLimit", L"SellStopLimit"
+    };
+    for (std::uint32_t type = 0; type < std::size(marginRateNames); ++type) {
+        properties.push_back({std::wstring(L"MarginRateInitial.") + marginRateNames[type],
+            [type](IMTConGroupSymbol& symbol, std::wstring_view text,
+                   bool& changed, std::wstring& error) {
+                return writePrecision8Number(text,
+                    [&]() { return symbol.MarginRateInitial(type); },
+                    [&](double value) { return symbol.MarginRateInitial(type, value); },
+                    changed, error);
+            }});
+        properties.push_back({std::wstring(L"MarginRateMaintenance.") + marginRateNames[type],
+            [type](IMTConGroupSymbol& symbol, std::wstring_view text,
+                   bool& changed, std::wstring& error) {
+                return writePrecision8Number(text,
+                    [&]() { return symbol.MarginRateMaintenance(type); },
+                    [&](double value) { return symbol.MarginRateMaintenance(type, value); },
+                    changed, error);
+            }});
+    }
+
+    ADD_GROUP_PRECISION8_FIELD(MarginRateLiquidity);
+    ADD_GROUP_FIELD(REFlags);
+    ADD_GROUP_PRECISION8_FIELD(MarginHedged);
+    ADD_GROUP_FIELD(PermissionsFlags);
+    ADD_GROUP_PRECISION8_FIELD(MarginRateCurrency);
+    ADD_GROUP_FIELD(BookDepthLimit);
+    ADD_GROUP_FIELD(IEFlags);
+    ADD_GROUP_FIELD(SwapYearDays);
+    ADD_GROUP_FIELD(SwapFlags);
+    ADD_GROUP_PRECISION8_FIELD(SwapRateSunday);
+    ADD_GROUP_PRECISION8_FIELD(SwapRateMonday);
+    ADD_GROUP_PRECISION8_FIELD(SwapRateTuesday);
+    ADD_GROUP_PRECISION8_FIELD(SwapRateWednesday);
+    ADD_GROUP_PRECISION8_FIELD(SwapRateThursday);
+    ADD_GROUP_PRECISION8_FIELD(SwapRateFriday);
+    ADD_GROUP_PRECISION8_FIELD(SwapRateSaturday);
+
+#undef ADD_GROUP_VOLUME_FIELD
+#undef ADD_GROUP_PRECISION8_FIELD
+#undef ADD_GROUP_FIELD
+#undef WIDEN
+#undef WIDEN_INNER
+#undef STRINGIFY
+#undef STRINGIFY_INNER
+    return properties;
+}
+
+bool getGroupNames(IMTManagerAPI* admin, std::vector<std::wstring>& names,
+                   std::wstring& error) {
+    names.clear();
+    if (!admin) {
+        error = L"MT5 API returned an empty administrator interface.";
+        return false;
+    }
+    IMTConGroup* group = admin->GroupCreate();
+    if (!group) {
+        error = L"MT5 API could not create a client group object.";
+        return false;
+    }
+    const std::uint32_t total = admin->GroupTotal();
+    names.reserve(total);
+    for (std::uint32_t position = 0; position < total; ++position) {
+        const MTAPIRES result = admin->GroupNext(position, group);
+        if (result != MT_RET_OK) {
+            group->Release();
+            error = apiError(L"Reading client group list", result);
+            names.clear();
+            return false;
+        }
+        const std::wstring name = cleanText(group->Group());
+        if (!name.empty()) names.push_back(name);
+    }
+    group->Release();
+    std::sort(names.begin(), names.end(), [](const std::wstring& left, const std::wstring& right) {
+        return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+    });
+    return true;
+}
+
+bool loadGroupSnapshot(IMTManagerAPI* admin, const std::wstring& groupName,
+                       const std::vector<SymbolFieldMapping>& fieldMappings,
+                       SymbolSnapshot& snapshot, std::wstring& error) {
+    snapshot = {};
+    IMTConSymbolArray* symbols = admin->SymbolCreateArray();
+    IMTConSymbol* symbol = admin->SymbolCreate();
+    IMTConSymbolSession* session = admin->SymbolSessionCreate();
+    if (!symbols || !symbol || !session) {
+        if (symbols) symbols->Release();
+        if (symbol) symbol->Release();
+        if (session) session->Release();
+        error = L"MT5 API could not create symbol data objects for the selected group.";
+        return false;
+    }
+
+    MTAPIRES result = admin->SymbolRequestArray(L"*", groupName.c_str(), symbols);
+    if (result != MT_RET_OK) {
+        symbols->Release();
+        symbol->Release();
+        session->Release();
+        error = L"Requesting symbols available to group '" + groupName + L"': " +
+            apiError(L"SymbolRequestArray", result);
+        return false;
+    }
+
+    const std::vector<Property> availableProperties = makeProperties();
+    const std::vector<Property> properties = applyFieldMappings(fieldMappings, availableProperties);
+    snapshot.columns.reserve(properties.size());
+    snapshot.sourceNames.reserve(properties.size());
+    for (std::size_t index = 0; index < properties.size(); ++index) {
+        snapshot.columns.push_back(properties[index].name);
+        snapshot.sourceNames.push_back(fieldMappings[index].sourceName);
+    }
+
+    const std::uint32_t total = symbols->Total();
+    snapshot.rows.reserve(total);
+    std::unordered_set<std::wstring> seen;
+    seen.reserve(total);
+    for (std::uint32_t position = 0; position < total; ++position) {
+        const IMTConSymbol* listedSymbol = symbols->Next(position);
+        if (!listedSymbol) {
+            ++snapshot.failedSymbols;
+            continue;
+        }
+        const std::wstring name = cleanText(listedSymbol->Symbol());
+        if (name.empty() || !seen.insert(name).second) continue;
+        result = admin->SymbolGet(name.c_str(), groupName.c_str(), symbol);
+        if (result != MT_RET_OK) {
+            ++snapshot.failedSymbols;
+            continue;
+        }
+
+        std::vector<std::wstring> row;
+        row.reserve(properties.size());
+        for (const Property& property : properties) {
+            row.push_back(property.read(*symbol, session));
+        }
+        snapshot.rows.push_back(std::move(row));
+    }
+    symbols->Release();
+    symbol->Release();
+    session->Release();
+    return true;
+}
+
 class ManagerConnection {
 public:
     ~ManagerConnection() {
-        if (admin_) {
-            admin_->Disconnect();
-            admin_->Release();
+        if (manager_) {
+            manager_->Disconnect();
+            manager_->Release();
         }
         if (initialized_) factory_.Shutdown();
     }
@@ -1348,14 +1568,14 @@ public:
             return false;
         }
 
-        result = factory_.CreateAdmin(version, &admin_);
-        if (result != MT_RET_OK || !admin_) {
-            error = result == MT_RET_OK ? L"MT5 API returned an empty administrator object."
-                                        : apiError(L"Creating MT5 administrator object", result);
+        result = factory_.CreateManager(version, &manager_);
+        if (result != MT_RET_OK || !manager_) {
+            error = result == MT_RET_OK ? L"MT5 API returned an empty manager object."
+                                        : apiError(L"Creating MT5 manager object", result);
             return false;
         }
 
-        result = admin_->Connect(server.c_str(), login, password.c_str(), nullptr, 0, 30000);
+        result = manager_->Connect(server.c_str(), login, password.c_str(), nullptr, 0, 30000);
         if (result != MT_RET_OK) {
             error = apiError(L"Connecting to MT5 server", result);
             return false;
@@ -1363,11 +1583,11 @@ public:
         return true;
     }
 
-    IMTAdminAPI* admin() const { return admin_; }
+    IMTManagerAPI* manager() const { return manager_; }
 
 private:
     CMTManagerAPIFactory factory_;
-    IMTAdminAPI* admin_ = nullptr;
+    IMTManagerAPI* manager_ = nullptr;
     bool initialized_ = false;
 };
 
@@ -1421,14 +1641,6 @@ std::wstring backupFilePath(const std::wstring& directory) {
         now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond,
         now.wMilliseconds, GetCurrentProcessId());
     return directory + L"\\" + name;
-}
-
-void releaseClones(std::unordered_map<std::wstring, IMTConSymbol*>& clones) {
-    for (auto& [name, symbol] : clones) {
-        (void)name;
-        if (symbol) symbol->Release();
-    }
-    clones.clear();
 }
 
 } // namespace
@@ -1668,14 +1880,14 @@ bool ValidateSymbolFieldValue(const SymbolFieldMapping& mapping,
 }
 
 bool IsSymbolFieldEditable(const std::wstring& sourceName) {
-    static const std::unordered_set<std::wstring> readOnlyFields = [] {
+    static const std::unordered_set<std::wstring> groupEditableFields = [] {
         std::unordered_set<std::wstring> fields;
-        for (const Property& property : makeProperties()) {
-            if (!property.editable || !property.write) fields.insert(property.name);
+        for (const GroupProperty& property : makeGroupProperties()) {
+            fields.insert(property.name);
         }
         return fields;
     }();
-    return !readOnlyFields.contains(sourceName);
+    return groupEditableFields.contains(sourceName);
 }
 
 bool LoadSymbolFieldMappings(const std::wstring& path,
@@ -1942,16 +2154,19 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
             mapping.constraint = constraint->second;
         }
     }
+    mappings.insert(mappings.begin(), SymbolFieldMapping{L"GroupPath", L"Group Path"});
     return true;
 }
 
-bool LoadSymbolSnapshot(const std::wstring& server,
-                        const std::wstring& loginText,
-                        const std::wstring& password,
-                        const std::vector<SymbolFieldMapping>& fieldMappings,
-                        SymbolSnapshot& snapshot,
-                        std::wstring& error) {
+bool LoadGroupSymbolSnapshot(const std::wstring& server,
+                             const std::wstring& loginText,
+                             const std::wstring& password,
+                             const std::vector<SymbolFieldMapping>& fieldMappings,
+                             std::vector<std::wstring>& groupNames,
+                             SymbolSnapshot& snapshot,
+                             std::wstring& error) {
     error.clear();
+    groupNames.clear();
     snapshot = {};
 
     std::uint64_t login = 0;
@@ -1966,71 +2181,88 @@ bool LoadSymbolSnapshot(const std::wstring& server,
 
     ManagerConnection connection;
     if (!connection.connect(server, login, password, error)) return false;
-    IMTAdminAPI* admin = connection.admin();
-
-    IMTConSymbol* symbol = admin->SymbolCreate();
-    IMTConSymbolSession* session = admin->SymbolSessionCreate();
-    if (!symbol || !session) {
-        if (symbol) symbol->Release();
-        if (session) session->Release();
-        error = L"MT5 API could not create symbol data objects.";
+    IMTManagerAPI* admin = connection.manager();
+    if (!getGroupNames(admin, groupNames, error)) return false;
+    if (groupNames.empty()) {
+        error = L"The connected server does not contain any client groups.";
         return false;
     }
 
-    const std::vector<Property> availableProperties = makeProperties();
-    const std::vector<Property> properties = applyFieldMappings(fieldMappings, availableProperties);
-    snapshot.columns.reserve(properties.size());
-    snapshot.sourceNames.reserve(properties.size());
-    for (std::size_t index = 0; index < properties.size(); ++index) {
-        snapshot.columns.push_back(properties[index].name);
-        snapshot.sourceNames.push_back(fieldMappings[index].sourceName);
+    std::vector<SymbolFieldMapping> symbolMappings;
+    symbolMappings.reserve(fieldMappings.size());
+    for (const SymbolFieldMapping& mapping : fieldMappings) {
+        if (mapping.sourceName != L"GroupPath") symbolMappings.push_back(mapping);
+    }
+    if (symbolMappings.empty()) {
+        error = L"No symbol fields are configured for group retrieval.";
+        return false;
     }
 
-    const std::uint32_t total = admin->SymbolTotal();
-    snapshot.rows.reserve(total);
-    for (std::uint32_t pos = 0; pos < total; ++pos) {
-        const MTAPIRES result = admin->SymbolNext(pos, symbol);
-        if (result != MT_RET_OK) {
-            ++snapshot.failedSymbols;
+    std::vector<std::wstring> groupErrors;
+    for (const std::wstring& groupName : groupNames) {
+        SymbolSnapshot groupSnapshot;
+        std::wstring groupError;
+        if (!loadGroupSnapshot(admin, groupName, symbolMappings, groupSnapshot, groupError)) {
+            groupErrors.push_back(groupName + L": " + groupError);
             continue;
         }
-
-        std::vector<std::wstring> row;
-        row.reserve(properties.size());
-        for (std::size_t column = 0; column < properties.size(); ++column) {
-            row.push_back(properties[column].read(*symbol, session));
+        snapshot.failedSymbols += groupSnapshot.failedSymbols;
+        if (snapshot.columns.empty()) {
+            snapshot.columns.reserve(groupSnapshot.columns.size() + 1);
+            snapshot.sourceNames.reserve(groupSnapshot.sourceNames.size() + 1);
+            snapshot.columns.push_back(L"Group Path");
+            snapshot.sourceNames.push_back(L"GroupPath");
+            snapshot.columns.insert(snapshot.columns.end(), groupSnapshot.columns.begin(),
+                                    groupSnapshot.columns.end());
+            snapshot.sourceNames.insert(snapshot.sourceNames.end(), groupSnapshot.sourceNames.begin(),
+                                        groupSnapshot.sourceNames.end());
         }
-        snapshot.rows.push_back(std::move(row));
+        snapshot.rows.reserve(snapshot.rows.size() + groupSnapshot.rows.size());
+        for (auto& row : groupSnapshot.rows) {
+            row.insert(row.begin(), groupName);
+            snapshot.rows.push_back(std::move(row));
+        }
     }
 
-    symbol->Release();
-    session->Release();
+    if (snapshot.rows.empty()) {
+        error = L"No symbols could be retrieved from the configured client groups.";
+        if (!groupErrors.empty()) error += L" First error: " + groupErrors.front();
+        return false;
+    }
+    snapshot.failedSymbols += static_cast<std::uint32_t>(groupErrors.size());
+    if (!groupErrors.empty()) {
+        error = std::to_wstring(groupErrors.size()) + L" client group(s) could not be loaded. " +
+            L"First error: " + groupErrors.front();
+    }
     return true;
 }
 
-bool ApplyImportedSymbolSnapshot(const std::wstring& server,
-                                 const std::wstring& loginText,
-                                 const std::wstring& password,
-                                 const std::vector<SymbolFieldMapping>& fieldMappings,
-                                 const SymbolSnapshot& importedSnapshot,
-                                 const std::wstring& backupDirectory,
-                                 const ApplyCheckpoint& checkpoint,
-                                 ApplyResult& result,
-                                 std::wstring& error) {
+static bool applyImportedSingleGroupSymbolSnapshot(const std::wstring& server,
+                                                   const std::wstring& loginText,
+                                                   const std::wstring& password,
+                                                   const std::wstring& groupName,
+                                                   const std::vector<SymbolFieldMapping>& fieldMappings,
+                                                   const SymbolSnapshot& importedSnapshot,
+                                                   const std::wstring& backupDirectory,
+                                                   const ApplyCheckpoint& checkpoint,
+                                                   ApplyResult& result,
+                                                   std::wstring& error) {
     result = {};
     error.clear();
-    if (server.empty() || password.empty() || fieldMappings.empty() ||
+    if (server.empty() || password.empty() || groupName.empty() || fieldMappings.empty() ||
         importedSnapshot.rows.empty() || importedSnapshot.columns.size() != fieldMappings.size()) {
-        error = L"The imported workbook or selected server profile is incomplete.";
+        error = L"The imported workbook, selected group, or server profile is incomplete.";
         return false;
     }
 
     std::size_t symbolColumn = fieldMappings.size();
+    std::size_t pathColumn = fieldMappings.size();
     for (std::size_t index = 0; index < fieldMappings.size(); ++index) {
         if (fieldMappings[index].sourceName == L"Symbol") symbolColumn = index;
+        if (fieldMappings[index].sourceName == L"Path") pathColumn = index;
     }
     if (symbolColumn == fieldMappings.size()) {
-        error = L"symbols.ini must include the Symbol field before a workbook can be applied.";
+        error = L"symbols.ini must include the Symbol field before a group update can be applied.";
         return false;
     }
 
@@ -2065,214 +2297,408 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
 
     ManagerConnection connection;
     if (!connection.connect(server, login, password, error)) return false;
-    IMTAdminAPI* admin = connection.admin();
-    IMTConSymbol* symbol = admin->SymbolCreate();
-    IMTConSymbolSession* session = admin->SymbolSessionCreate();
-    if (!symbol || !session) {
-        if (symbol) symbol->Release();
-        if (session) session->Release();
-        error = L"MT5 API could not create symbol data objects for import.";
-        return false;
-    }
-
+    IMTManagerAPI* admin = connection.manager();
     const std::vector<Property> availableProperties = makeProperties();
     const std::vector<Property> properties = applyFieldMappings(fieldMappings, availableProperties);
-    const std::vector<Property>& backupProperties = availableProperties;
-    SymbolSnapshot backup;
-    backup.columns.reserve(backupProperties.size());
-    backup.sourceNames.reserve(backupProperties.size());
-    for (const Property& property : backupProperties) {
-        backup.columns.push_back(property.name);
-        backup.sourceNames.push_back(property.name);
+    const std::vector<GroupProperty> groupProperties = makeGroupProperties();
+    std::unordered_map<std::wstring, const Property*> effectivePropertyByName;
+    effectivePropertyByName.reserve(availableProperties.size());
+    for (const Property& property : availableProperties) {
+        effectivePropertyByName.emplace(property.name, &property);
+    }
+    std::unordered_map<std::wstring, std::size_t> groupPropertyByName;
+    groupPropertyByName.reserve(groupProperties.size());
+    for (std::size_t index = 0; index < groupProperties.size(); ++index) {
+        groupPropertyByName.emplace(groupProperties[index].name, index);
     }
 
-    std::unordered_map<std::wstring, IMTConSymbol*> originalConfigs;
-    originalConfigs.reserve(requestedNames.size());
-    const std::uint32_t serverSymbolTotal = admin->SymbolTotal();
-    backup.rows.reserve(serverSymbolTotal);
-    bool cloneFailure = false;
-    for (std::uint32_t position = 0; position < serverSymbolTotal; ++position) {
-        const MTAPIRES nextResult = admin->SymbolNext(position, symbol);
-        if (nextResult != MT_RET_OK) {
-            ++backup.failedSymbols;
+    // Capture the effective group values before planning any writes. This is also the
+    // human-readable backup used by the application's restore workflow.
+    SymbolSnapshot backup;
+    if (!loadGroupSnapshot(admin, groupName, fieldMappings, backup, error)) return false;
+    if (backup.failedSymbols != 0 || backup.rows.empty()) {
+        error = backup.rows.empty()
+            ? L"The selected group returned no symbols. No values were applied."
+            : L"Could not retrieve every symbol in the selected group for a complete backup. No values were applied.";
+        return false;
+    }
+
+    std::unordered_map<std::wstring, std::size_t> currentRowByName;
+    currentRowByName.reserve(backup.rows.size());
+    for (std::size_t rowIndex = 0; rowIndex < backup.rows.size(); ++rowIndex) {
+        if (symbolColumn < backup.rows[rowIndex].size()) {
+            currentRowByName.emplace(backup.rows[rowIndex][symbolColumn], rowIndex);
+        }
+    }
+
+    IMTConSymbol* effectiveSymbol = admin->SymbolCreate();
+    IMTConSymbolSession* session = admin->SymbolSessionCreate();
+    IMTConGroup* group = admin->GroupCreate();
+    IMTConGroupSymbol* groupSymbol = admin->GroupSymbolCreate();
+    if (!effectiveSymbol || !session || !group || !groupSymbol) {
+        if (effectiveSymbol) effectiveSymbol->Release();
+        if (session) session->Release();
+        if (group) group->Release();
+        if (groupSymbol) groupSymbol->Release();
+        error = L"MT5 API could not create group update objects.";
+        return false;
+    }
+    MTAPIRES apiResult = admin->GroupGet(groupName.c_str(), group);
+    if (apiResult != MT_RET_OK) {
+        effectiveSymbol->Release();
+        session->Release();
+        group->Release();
+        groupSymbol->Release();
+        error = L"Reading group '" + groupName + L"': " + apiError(L"GroupGet", apiResult);
+        return false;
+    }
+
+    struct PlannedGroupUpdate {
+        std::wstring name;
+        std::wstring groupPath;
+        std::size_t importRow = 0;
+        std::vector<std::size_t> changedColumns;
+    };
+    std::vector<PlannedGroupUpdate> planned;
+    planned.reserve(importedSnapshot.rows.size());
+    std::unordered_map<std::wstring, IMTConGroupSymbol*> originalOverrides;
+    std::unordered_set<std::wstring> originalOverrideExists;
+    originalOverrides.reserve(importedSnapshot.rows.size());
+
+    auto releaseGroupClones = [&]() {
+        for (auto& [name, clone] : originalOverrides) {
+            (void)name;
+            if (clone) clone->Release();
+        }
+        originalOverrides.clear();
+    };
+    auto findGroupSymbol = [&](const std::wstring& groupPath, std::uint32_t& foundPosition,
+                               IMTConGroupSymbol* destination) -> MTAPIRES {
+        foundPosition = (std::numeric_limits<std::uint32_t>::max)();
+        const std::uint32_t total = group->SymbolTotal();
+        for (std::uint32_t position = 0; position < total; ++position) {
+            const MTAPIRES nextResult = group->SymbolNext(position, destination);
+            if (nextResult != MT_RET_OK) return nextResult;
+            const std::wstring existingPath = cleanText(destination->Path());
+            if (CompareStringOrdinal(groupPath.c_str(), -1,
+                                     existingPath.c_str(), -1, TRUE) == CSTR_EQUAL) {
+                foundPosition = position;
+                return MT_RET_OK;
+            }
+        }
+        return MT_RET_OK;
+    };
+    auto copyMostSpecificMatchingRule = [&](const std::wstring& groupPath,
+                                            IMTConGroupSymbol* destination,
+                                            bool& foundRule) -> MTAPIRES {
+        foundRule = false;
+        IMTConGroupSymbol* candidate = admin->GroupSymbolCreate();
+        IMTConGroupSymbol* best = admin->GroupSymbolCreate();
+        if (!candidate || !best) {
+            if (candidate) candidate->Release();
+            if (best) best->Release();
+            return MT_RET_ERR_PARAMS;
+        }
+        std::size_t bestSpecificity = 0;
+        MTAPIRES result = MT_RET_OK;
+        for (std::uint32_t position = 0; position < group->SymbolTotal(); ++position) {
+            result = group->SymbolNext(position, candidate);
+            if (result != MT_RET_OK) break;
+            const std::wstring pattern = cleanText(candidate->Path());
+            if (pattern.empty() || !PathMatchSpecW(groupPath.c_str(), pattern.c_str())) continue;
+            std::size_t specificity = 0;
+            for (const wchar_t ch : pattern) {
+                if (ch != L'*' && ch != L'?') ++specificity;
+            }
+            if (foundRule && specificity <= bestSpecificity) continue;
+            result = best->Assign(candidate);
+            if (result != MT_RET_OK) break;
+            foundRule = true;
+            bestSpecificity = specificity;
+        }
+        if (result == MT_RET_OK && foundRule) result = destination->Assign(best);
+        candidate->Release();
+        best->Release();
+        return result;
+    };
+
+    bool preflightFailed = false;
+    for (std::size_t rowIndex = 0; rowIndex < importedSnapshot.rows.size(); ++rowIndex) {
+        const auto& row = importedSnapshot.rows[rowIndex];
+        const std::wstring& name = row[symbolColumn];
+        const auto current = currentRowByName.find(name);
+        if (current == currentRowByName.end()) {
+            ++result.skipped;
             continue;
         }
-        const std::wstring name = cleanText(symbol->Symbol());
-        std::vector<std::wstring> row;
-        row.reserve(backupProperties.size());
-        for (const Property& property : backupProperties) {
-            std::wstring value = property.read(*symbol, session);
-            if ((property.name.rfind(L"QuoteSessions.", 0) == 0 ||
-                 property.name.rfind(L"TradeSessions.", 0) == 0) &&
-                value.find(L"[MTAPIRES=") != std::wstring::npos) ++backup.failedSymbols;
-            row.push_back(std::move(value));
+        if (symbolColumn >= backup.rows[current->second].size() ||
+            row[symbolColumn] != backup.rows[current->second][symbolColumn]) {
+            error = L"Symbol identity changed for '" + name + L"'. No values were applied.";
+            preflightFailed = true;
+            break;
         }
-        backup.rows.push_back(std::move(row));
+        if (pathColumn < fieldMappings.size() &&
+            row[pathColumn] != backup.rows[current->second][pathColumn]) {
+            error = L"Path is read-only and cannot be changed for symbol '" + name + L"'. No values were applied.";
+            preflightFailed = true;
+            break;
+        }
+        apiResult = admin->SymbolGet(name.c_str(), groupName.c_str(), effectiveSymbol);
+        if (apiResult != MT_RET_OK) {
+            error = L"Could not retrieve symbol '" + name + L"' for group preflight: " +
+                apiError(L"SymbolGet", apiResult) + L" No values were applied.";
+            preflightFailed = true;
+            break;
+        }
+        const std::wstring groupPath = cleanText(effectiveSymbol->Path());
+        if (groupPath.empty()) {
+            error = L"Symbol '" + name + L"' has no full symbol path. No values were applied.";
+            preflightFailed = true;
+            break;
+        }
 
-        if (requestedNames.contains(name)) {
-            IMTConSymbol* clone = admin->SymbolCreate();
-            if (!clone || clone->Assign(symbol) != MT_RET_OK) {
-                if (clone) clone->Release();
-                cloneFailure = true;
+        PlannedGroupUpdate plan;
+        plan.name = name;
+        plan.groupPath = groupPath;
+        plan.importRow = rowIndex;
+        for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
+            const std::wstring& sourceName = fieldMappings[column].sourceName;
+            if (sourceName == L"Symbol" || sourceName == L"Path") continue;
+            const auto groupProperty = groupPropertyByName.find(sourceName);
+            if (groupProperty == groupPropertyByName.end()) {
+                if (column < properties.size() && properties[column].editable && properties[column].write) {
+                    bool wouldChange = false;
+                    std::wstring compareError;
+                    const std::wstring serverValue = serverValueForField(fieldMappings[column], row[column]);
+                    if (!properties[column].write(*effectiveSymbol, serverValue, session,
+                                                  wouldChange, compareError)) {
+                        error = L"Symbol '" + name + L"', field '" + sourceName + L"': " +
+                            compareError + L" No values were applied.";
+                        preflightFailed = true;
+                        break;
+                    }
+                    if (wouldChange) {
+                        error = L"Field '" + sourceName + L"' cannot be overridden for a client group. "
+                            L"No values were applied.";
+                        preflightFailed = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+            if (column >= properties.size() || !properties[column].write) {
+                error = L"Field '" + sourceName + L"' has no effective-value converter. No values were applied.";
+                preflightFailed = true;
                 break;
             }
-            originalConfigs.emplace(name, clone);
+            bool wouldChange = false;
+            std::wstring compareError;
+            const std::wstring serverValue = serverValueForField(fieldMappings[column], row[column]);
+            if (!properties[column].write(*effectiveSymbol, serverValue, session,
+                                          wouldChange, compareError)) {
+                error = L"Symbol '" + name + L"', field '" + sourceName + L"': " +
+                    compareError + L" No values were applied.";
+                preflightFailed = true;
+                break;
+            }
+            if (wouldChange) plan.changedColumns.push_back(column);
         }
+        if (preflightFailed) break;
+        if (plan.changedColumns.empty()) {
+            ++result.unchanged;
+            continue;
+        }
+
+        // Do not alter wildcard/group rules. Capture an exact override if present;
+        // otherwise create a new symbol-specific override.
+        std::uint32_t position = 0;
+        apiResult = findGroupSymbol(groupPath, position, groupSymbol);
+        if (apiResult != MT_RET_OK) {
+            error = L"Could not inspect group overrides for symbol '" + name + L"': " +
+                apiError(L"Group SymbolNext", apiResult) + L" No values were applied.";
+            preflightFailed = true;
+            break;
+        }
+        const bool exists = position != (std::numeric_limits<std::uint32_t>::max)();
+        if (exists) {
+            IMTConGroupSymbol* clone = admin->GroupSymbolCreate();
+            if (!clone || clone->Assign(groupSymbol) != MT_RET_OK) {
+                if (clone) clone->Release();
+                error = L"Cannot capture the current group override for symbol '" + name +
+                    L"'. No values were applied.";
+                preflightFailed = true;
+                break;
+            }
+            originalOverrideExists.insert(name);
+            originalOverrides.emplace(name, clone);
+        } else {
+            originalOverrides.emplace(name, nullptr);
+        }
+        planned.push_back(std::move(plan));
     }
-    if (cloneFailure || backup.failedSymbols != 0) {
-        releaseClones(originalConfigs);
-        symbol->Release();
+
+    if (preflightFailed) {
+        releaseGroupClones();
+        effectiveSymbol->Release();
         session->Release();
-        error = cloneFailure
-            ? L"Cannot capture a complete in-memory rollback copy of the current symbols. No changes were applied."
-            : L"Could not retrieve every current symbol field to create a complete backup. No changes were applied.";
+        group->Release();
+        groupSymbol->Release();
         return false;
     }
-    if (backup.rows.empty()) {
-        releaseClones(originalConfigs);
-        symbol->Release();
+    if (planned.empty()) {
+        releaseGroupClones();
+        effectiveSymbol->Release();
         session->Release();
-        error = L"The connected server returned no symbol records. No changes were applied.";
-        return false;
+        group->Release();
+        groupSymbol->Release();
+        return true;
     }
 
     std::error_code fsError;
     std::filesystem::create_directories(std::filesystem::path(backupDirectory), fsError);
     if (fsError || !std::filesystem::is_directory(std::filesystem::path(backupDirectory), fsError)) {
-        releaseClones(originalConfigs);
-        symbol->Release();
+        releaseGroupClones();
+        effectiveSymbol->Release();
         session->Release();
+        group->Release();
+        groupSymbol->Release();
         error = L"Cannot create the backup directory: " + backupDirectory;
         return false;
     }
     result.backupPath = backupFilePath(backupDirectory);
     if (!saveSnapshotCsv(backup, result.backupPath, error)) {
-        releaseClones(originalConfigs);
-        symbol->Release();
+        releaseGroupClones();
+        effectiveSymbol->Release();
         session->Release();
+        group->Release();
+        groupSymbol->Release();
         return false;
     }
 
-    std::vector<std::wstring> attempted;
-    attempted.reserve(importedSnapshot.rows.size());
-    for (std::size_t rowIndex = 0; rowIndex < importedSnapshot.rows.size(); ++rowIndex) {
-        const std::wstring& name = importedSnapshot.rows[rowIndex][symbolColumn];
+    std::vector<std::size_t> attempted;
+    attempted.reserve(planned.size());
+    for (std::size_t planIndex = 0; planIndex < planned.size(); ++planIndex) {
+        const PlannedGroupUpdate& plan = planned[planIndex];
         if (checkpoint) {
-            const ApplyChoice choice = checkpoint({rowIndex, importedSnapshot.rows.size(), false, name});
+            const ApplyChoice choice = checkpoint({planIndex, planned.size(), false, plan.name});
             if (choice != ApplyChoice::Continue) {
                 result.aborted = true;
                 result.restoreRequested = choice == ApplyChoice::StopAndRestore;
-                result.notProcessed = importedSnapshot.rows.size() - rowIndex;
+                result.notProcessed = planned.size() - planIndex;
                 break;
             }
         }
 
-        const auto original = originalConfigs.find(name);
-        if (original == originalConfigs.end()) {
-            ++result.skipped;
-            continue;
-        }
-        const MTAPIRES getResult = admin->SymbolGet(name.c_str(), symbol);
-        if (getResult != MT_RET_OK) {
+        apiResult = admin->GroupGet(groupName.c_str(), group);
+        if (apiResult != MT_RET_OK) {
             ++result.failed;
-            if (result.firstFailure.empty()) {
-                result.firstFailure = L"Could not retrieve symbol '" + name + L"': " + apiError(L"SymbolGet", getResult);
+            if (result.firstFailure.empty()) result.firstFailure =
+                L"Could not reload group '" + groupName + L"': " + apiError(L"GroupGet", apiResult);
+            continue;
+        }
+        apiResult = admin->SymbolGet(plan.name.c_str(), groupName.c_str(), effectiveSymbol);
+        if (apiResult != MT_RET_OK) {
+            ++result.failed;
+            if (result.firstFailure.empty()) result.firstFailure =
+                L"Could not retrieve symbol '" + plan.name + L"' before applying group settings: " +
+                apiError(L"SymbolGet", apiResult);
+            continue;
+        }
+        std::uint32_t position = 0;
+        apiResult = findGroupSymbol(plan.groupPath, position, groupSymbol);
+        if (apiResult != MT_RET_OK) {
+            ++result.failed;
+            if (result.firstFailure.empty()) result.firstFailure =
+                L"Could not inspect group overrides for symbol '" + plan.name + L"': " +
+                apiError(L"Group SymbolNext", apiResult);
+            continue;
+        }
+        const bool exists = position != (std::numeric_limits<std::uint32_t>::max)();
+        if (!exists) {
+            bool foundRule = false;
+            apiResult = copyMostSpecificMatchingRule(plan.groupPath, groupSymbol, foundRule);
+            if (apiResult == MT_RET_OK && !foundRule) apiResult = groupSymbol->Default();
+            if (apiResult == MT_RET_OK) apiResult = groupSymbol->Path(plan.groupPath.c_str());
+            for (const GroupProperty& groupProperty : groupProperties) {
+                if (apiResult != MT_RET_OK) break;
+                const auto effectiveProperty = effectivePropertyByName.find(groupProperty.name);
+                if (effectiveProperty == effectivePropertyByName.end() ||
+                    !effectiveProperty->second->read || !groupProperty.write) continue;
+                const std::wstring currentValue = effectiveProperty->second->read(*effectiveSymbol, session);
+                bool fieldChanged = false;
+                std::wstring fieldError;
+                if (!groupProperty.write(*groupSymbol, currentValue, fieldChanged, fieldError)) {
+                    apiResult = MT_RET_ERR_PARAMS;
+                    if (result.firstFailure.empty()) {
+                        result.firstFailure = L"Could not preserve effective field '" +
+                            groupProperty.name + L"' for symbol '" + plan.name + L"': " + fieldError;
+                    }
+                }
             }
+        }
+        if (apiResult != MT_RET_OK) {
+            ++result.failed;
+            if (result.firstFailure.empty()) result.firstFailure =
+                L"Could not prepare the group override for symbol '" + plan.name + L"': " +
+                apiError(L"GroupSymbol setup", apiResult);
             continue;
         }
 
-        bool changed = false;
         bool rowValid = true;
-        std::wstring rowError;
-        std::vector<std::size_t> changedColumns;
-        changedColumns.reserve(fieldMappings.size());
-        std::vector<std::wstring> originalValues(fieldMappings.size());
-        for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
-            if (fieldMappings[column].sourceName == L"Symbol" ||
-                fieldMappings[column].sourceName == L"Path") {
-                continue;
-            }
-            originalValues[column] = properties[column].read(*symbol, session);
-        }
-
-        for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
-            if (fieldMappings[column].sourceName == L"Symbol") {
-                if (importedSnapshot.rows[rowIndex][column] != cleanText(symbol->Symbol())) {
-                    rowError = L"The Symbol value does not match the server symbol '" + name + L"'.";
-                    rowValid = false;
-                    break;
-                }
-                continue;
-            }
-            if (fieldMappings[column].sourceName == L"Path") continue;
-            if (!properties[column].editable || !properties[column].write) continue;
-            const std::wstring& importedValue = importedSnapshot.rows[rowIndex][column];
-            if (importedValue == originalValues[column]) continue;
-
-            changedColumns.push_back(column);
-
+        for (const std::size_t column : plan.changedColumns) {
+            const auto groupProperty = groupPropertyByName.find(fieldMappings[column].sourceName);
+            if (groupProperty == groupPropertyByName.end()) continue;
             bool fieldChanged = false;
             std::wstring fieldError;
-            const std::wstring serverValue = serverValueForField(fieldMappings[column], importedValue);
-            if (!properties[column].write(*symbol, serverValue, session, fieldChanged, fieldError)) {
-                rowError = L"Symbol '" + name + L"', field '" + fieldMappings[column].sourceName +
-                    L"': " + fieldError;
+            const std::wstring serverValue = serverValueForField(
+                fieldMappings[column], importedSnapshot.rows[plan.importRow][column]);
+            if (!groupProperties[groupProperty->second].write(*groupSymbol, serverValue,
+                                                               fieldChanged, fieldError)) {
                 rowValid = false;
+                if (result.firstFailure.empty()) result.firstFailure =
+                    L"Symbol '" + plan.name + L"', field '" + fieldMappings[column].sourceName +
+                    L"': " + fieldError;
                 break;
-            }
-            if (fieldChanged) {
-                changed = true;
             }
         }
         if (!rowValid) {
             ++result.failed;
-            if (result.firstFailure.empty()) result.firstFailure = std::move(rowError);
-            continue;
-        }
-        if (!changed) {
-            ++result.unchanged;
             continue;
         }
 
-        attempted.push_back(name);
-        const MTAPIRES updateResult = admin->SymbolUpdate(symbol);
-        if (updateResult != MT_RET_OK) {
+        attempted.push_back(planIndex);
+        apiResult = exists ? group->SymbolUpdate(position, groupSymbol) : group->SymbolAdd(groupSymbol);
+        if (apiResult == MT_RET_OK) apiResult = admin->GroupUpdate(group);
+        if (apiResult != MT_RET_OK) {
             ++result.failed;
-            if (result.firstFailure.empty()) {
-                result.firstFailure = L"Could not update symbol '" + name + L"': " +
-                    apiError(L"SymbolUpdate", updateResult);
-            }
+            if (result.firstFailure.empty()) result.firstFailure =
+                L"Could not save group settings for symbol '" + plan.name + L"': " +
+                apiError(L"GroupUpdate", apiResult);
             continue;
         }
 
-        const MTAPIRES verifyResult = admin->SymbolGet(name.c_str(), symbol);
-        if (verifyResult != MT_RET_OK) {
+        apiResult = admin->SymbolGet(plan.name.c_str(), groupName.c_str(), effectiveSymbol);
+        if (apiResult != MT_RET_OK) {
             ++result.failed;
-            if (result.firstFailure.empty()) {
-                result.firstFailure = L"Symbol '" + name +
-                    L"' was submitted, but the saved values could not be verified: " +
-                    apiError(L"SymbolGet", verifyResult);
-            }
+            if (result.firstFailure.empty()) result.firstFailure =
+                L"Group settings for symbol '" + plan.name +
+                L"' were submitted, but could not be verified: " + apiError(L"SymbolGet", apiResult);
             continue;
         }
-
         bool verified = true;
-        for (const std::size_t column : changedColumns) {
-            const std::wstring rawActualValue = properties[column].read(*symbol, session);
-            const std::wstring actualValue = SymbolValueForDisplay(fieldMappings[column], rawActualValue);
-            const std::wstring serverValue = serverValueForField(
-                fieldMappings[column], importedSnapshot.rows[rowIndex][column]);
+        for (const std::size_t column : plan.changedColumns) {
             bool wouldChange = false;
             std::wstring verifyError;
-            if (!properties[column].write(*symbol, serverValue,
-                                          session, wouldChange, verifyError) || wouldChange) {
+            const std::wstring serverValue = serverValueForField(
+                fieldMappings[column], importedSnapshot.rows[plan.importRow][column]);
+            if (!properties[column].write(*effectiveSymbol, serverValue, session,
+                                           wouldChange, verifyError) || wouldChange) {
                 verified = false;
                 if (result.firstFailure.empty()) {
-                    result.firstFailure = L"Symbol '" + name + L"', field '" +
+                    result.firstFailure = L"Symbol '" + plan.name + L"', field '" +
                         fieldMappings[column].sourceName + L"' was not saved. Expected '" +
-                        SymbolValueForDisplay(fieldMappings[column], serverValue) +
-                        L"', server returned '" +
-                        actualValue + L"'.";
+                        SymbolValueForDisplay(fieldMappings[column], serverValue) + L"'.";
+                    if (!verifyError.empty()) result.firstFailure += L" " + verifyError;
                 }
                 break;
             }
@@ -2282,8 +2708,7 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
     }
 
     if (!result.aborted && checkpoint) {
-        const ApplyChoice choice = checkpoint({importedSnapshot.rows.size(),
-            importedSnapshot.rows.size(), false, L""});
+        const ApplyChoice choice = checkpoint({planned.size(), planned.size(), false, L""});
         if (choice != ApplyChoice::Continue) {
             result.aborted = true;
             result.restoreRequested = choice == ApplyChoice::StopAndRestore;
@@ -2292,57 +2717,65 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
 
     if (result.restoreRequested && !attempted.empty()) {
         for (std::size_t offset = 0; offset < attempted.size(); ++offset) {
-            const std::wstring& name = attempted[attempted.size() - 1 - offset];
-            if (checkpoint) checkpoint({offset, attempted.size(), true, name});
-            const auto original = originalConfigs.find(name);
-            if (original == originalConfigs.end() ||
-                admin->SymbolGet(name.c_str(), symbol) != MT_RET_OK ||
-                symbol->Assign(original->second) != MT_RET_OK) {
+            const std::size_t planIndex = attempted[attempted.size() - 1 - offset];
+            const PlannedGroupUpdate& plan = planned[planIndex];
+            if (checkpoint) checkpoint({offset, attempted.size(), true, plan.name});
+            apiResult = admin->GroupGet(groupName.c_str(), group);
+            std::uint32_t position = 0;
+            if (apiResult == MT_RET_OK) apiResult = findGroupSymbol(plan.groupPath, position, groupSymbol);
+            if (apiResult != MT_RET_OK) {
                 ++result.restoreFailed;
-                if (result.firstFailure.empty()) {
-                    result.firstFailure = L"Could not restore symbol '" + name + L"'.";
-                }
+                if (result.firstFailure.empty()) result.firstFailure =
+                    L"Could not reload group '" + groupName + L"' for restore: " +
+                    apiError(L"GroupGet", apiResult);
                 continue;
             }
-            const MTAPIRES restoreResult = admin->SymbolUpdate(symbol);
-            if (restoreResult != MT_RET_OK) {
+            const bool exists = position != (std::numeric_limits<std::uint32_t>::max)();
+
+            const auto original = originalOverrides.find(plan.name);
+            const bool hadOriginal = originalOverrideExists.contains(plan.name);
+            if (hadOriginal && original != originalOverrides.end() && original->second) {
+                if (exists) apiResult = group->SymbolUpdate(position, original->second);
+                else apiResult = group->SymbolAdd(original->second);
+            } else if (exists) {
+                apiResult = group->SymbolDelete(position);
+            } else {
+                apiResult = MT_RET_OK;
+            }
+            if (apiResult == MT_RET_OK && (hadOriginal || exists)) {
+                apiResult = admin->GroupUpdate(group);
+            }
+            if (apiResult != MT_RET_OK) {
                 ++result.restoreFailed;
-                if (result.firstFailure.empty()) {
-                    result.firstFailure = L"Could not restore symbol '" + name + L"': " +
-                        apiError(L"SymbolUpdate", restoreResult);
-                }
+                if (result.firstFailure.empty()) result.firstFailure =
+                    L"Could not restore group override for symbol '" + plan.name + L"': " +
+                    apiError(L"GroupUpdate", apiResult);
                 continue;
             }
 
-            const MTAPIRES verifyRestoreResult = admin->SymbolGet(name.c_str(), symbol);
-            if (verifyRestoreResult != MT_RET_OK) {
+            apiResult = admin->SymbolGet(plan.name.c_str(), groupName.c_str(), effectiveSymbol);
+            if (apiResult != MT_RET_OK) {
                 ++result.restoreFailed;
-                if (result.firstFailure.empty()) {
-                    result.firstFailure = L"Symbol '" + name +
-                        L"' was restored, but the restored values could not be verified: " +
-                        apiError(L"SymbolGet", verifyRestoreResult);
-                }
+                if (result.firstFailure.empty()) result.firstFailure =
+                    L"Restored group override for '" + plan.name +
+                    L"', but verification failed: " + apiError(L"SymbolGet", apiResult);
                 continue;
             }
-
-            bool restored = true;
-            for (const Property& property : backupProperties) {
-                if (!property.editable || !property.write) continue;
-
-                const std::wstring expectedValue = property.read(*original->second, session);
-                const std::wstring actualValue = property.read(*symbol, session);
+            const auto current = currentRowByName.find(plan.name);
+            bool restored = current != currentRowByName.end();
+            for (const std::size_t column : plan.changedColumns) {
+                if (!restored) break;
+                const std::wstring expectedValue = serverValueForField(
+                    fieldMappings[column], backup.rows[current->second][column]);
                 bool wouldChange = false;
                 std::wstring verifyError;
-                if (!property.write(*symbol, expectedValue, session, wouldChange, verifyError) ||
-                    wouldChange) {
+                if (!properties[column].write(*effectiveSymbol, expectedValue, session,
+                                               wouldChange, verifyError) || wouldChange) {
                     restored = false;
                     if (result.firstFailure.empty()) {
-                        result.firstFailure = L"Symbol '" + name + L"', field '" +
-                            property.name + L"' was not restored. Expected '" + expectedValue +
-                            L"', server returned '" + actualValue + L"'.";
-                        if (!verifyError.empty()) {
-                            result.firstFailure += L" " + verifyError;
-                        }
+                        result.firstFailure = L"Symbol '" + plan.name + L"', field '" +
+                            fieldMappings[column].sourceName + L"' was not restored.";
+                        if (!verifyError.empty()) result.firstFailure += L" " + verifyError;
                     }
                     break;
                 }
@@ -2352,8 +2785,278 @@ bool ApplyImportedSymbolSnapshot(const std::wstring& server,
         }
         if (checkpoint) checkpoint({attempted.size(), attempted.size(), true, L""});
     }
-    releaseClones(originalConfigs);
-    symbol->Release();
+
+    releaseGroupClones();
+    effectiveSymbol->Release();
     session->Release();
+    group->Release();
+    groupSymbol->Release();
+    return true;
+}
+
+bool ApplyImportedGroupSymbolSnapshot(const std::wstring& server,
+                                      const std::wstring& loginText,
+                                      const std::wstring& password,
+                                      const std::vector<SymbolFieldMapping>& fieldMappings,
+                                      const SymbolSnapshot& baselineSnapshot,
+                                      const SymbolSnapshot& importedSnapshot,
+                                      const std::wstring& backupDirectory,
+                                      const ApplyCheckpoint& checkpoint,
+                                      ApplyResult& result,
+                                      std::wstring& error) {
+    result = {};
+    error.clear();
+    if (fieldMappings.empty() || baselineSnapshot.rows.empty() || importedSnapshot.rows.empty() ||
+        fieldMappings.size() != importedSnapshot.columns.size() ||
+        fieldMappings.size() != baselineSnapshot.columns.size()) {
+        error = L"The client-group table is empty or its columns do not match symbols.ini.";
+        return false;
+    }
+
+    std::size_t groupPathColumn = fieldMappings.size();
+    std::size_t symbolColumn = fieldMappings.size();
+    for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
+        if (fieldMappings[column].sourceName == L"GroupPath") groupPathColumn = column;
+        if (fieldMappings[column].sourceName == L"Symbol") symbolColumn = column;
+    }
+    if (groupPathColumn == fieldMappings.size() || symbolColumn == fieldMappings.size()) {
+        error = L"The table must contain Group Path and Symbol columns.";
+        return false;
+    }
+
+    std::vector<SymbolFieldMapping> symbolMappings;
+    symbolMappings.reserve(fieldMappings.size() - 1);
+    for (const SymbolFieldMapping& mapping : fieldMappings) {
+        if (mapping.sourceName != L"GroupPath") symbolMappings.push_back(mapping);
+    }
+
+    auto compositeKey = [&](const std::vector<std::wstring>& row,
+                            std::size_t groupColumn, std::size_t nameColumn) {
+        if (groupColumn >= row.size() || nameColumn >= row.size() ||
+            row[groupColumn].empty() || row[nameColumn].empty()) return std::wstring{};
+        return row[groupColumn] + L"\x1f" + row[nameColumn];
+    };
+
+    std::unordered_set<std::wstring> knownGroups;
+    std::unordered_map<std::wstring, const std::vector<std::wstring>*> baselineRows;
+    std::unordered_map<std::wstring, std::wstring> groupBySymbol;
+    baselineRows.reserve(baselineSnapshot.rows.size());
+    groupBySymbol.reserve(baselineSnapshot.rows.size());
+    for (const auto& row : baselineSnapshot.rows) {
+        if (groupPathColumn >= row.size() || symbolColumn >= row.size()) continue;
+        const std::wstring& groupPath = row[groupPathColumn];
+        const std::wstring& symbol = row[symbolColumn];
+        if (groupPath.empty() || symbol.empty()) continue;
+        knownGroups.insert(groupPath);
+        baselineRows.emplace(compositeKey(row, groupPathColumn, symbolColumn), &row);
+        groupBySymbol.emplace(symbol, groupPath);
+    }
+    if (knownGroups.empty()) {
+        error = L"The current server snapshot has no group paths. No values were applied.";
+        return false;
+    }
+
+    std::unordered_map<std::wstring, std::vector<std::size_t>> importedRowsByGroup;
+    std::vector<std::wstring> groupOrder;
+    std::unordered_set<std::wstring> requestedRows;
+    importedRowsByGroup.reserve(knownGroups.size());
+    requestedRows.reserve(importedSnapshot.rows.size());
+    for (std::size_t rowIndex = 0; rowIndex < importedSnapshot.rows.size(); ++rowIndex) {
+        const auto& row = importedSnapshot.rows[rowIndex];
+        if (row.size() != fieldMappings.size()) {
+            error = L"Every imported row must contain Group Path and all configured symbol columns.";
+            return false;
+        }
+        const std::wstring& groupPath = row[groupPathColumn];
+        const std::wstring& symbol = row[symbolColumn];
+        if (groupPath.empty() || symbol.empty()) {
+            error = L"Every imported row must contain a Group Path and Symbol.";
+            return false;
+        }
+        if (!knownGroups.contains(groupPath)) {
+            error = L"Group Path '" + groupPath + L"' is not in the current server snapshot. No values were applied.";
+            return false;
+        }
+        const std::wstring key = compositeKey(row, groupPathColumn, symbolColumn);
+        if (!requestedRows.insert(key).second) {
+            error = L"The workbook contains a duplicate Group Path/Symbol row for '" +
+                groupPath + L" / " + symbol + L"'.";
+            return false;
+        }
+        const auto priorGroup = groupBySymbol.find(symbol);
+        if (priorGroup != groupBySymbol.end() && priorGroup->second != groupPath &&
+            !baselineRows.contains(key)) {
+            error = L"Group Path cannot be changed for symbol '" + symbol + L"'. No values were applied.";
+            return false;
+        }
+        for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
+            if (column == groupPathColumn) continue;
+            std::wstring validationError;
+            const std::wstring storageValue = SymbolValueForStorage(fieldMappings[column], row[column]);
+            if (!ValidateSymbolFieldValue(fieldMappings[column], storageValue, validationError)) {
+                error = L"Group '" + groupPath + L"', symbol '" + symbol + L"', field '" +
+                    fieldMappings[column].sourceName + L"': " + validationError +
+                    L" No values were applied.";
+                return false;
+            }
+        }
+        auto [group, inserted] = importedRowsByGroup.try_emplace(groupPath);
+        if (inserted) groupOrder.push_back(groupPath);
+        group->second.push_back(rowIndex);
+    }
+
+    auto makeGroupSnapshot = [&](const SymbolSnapshot& source,
+                                 const std::vector<std::size_t>& selectedRows) {
+        SymbolSnapshot subset;
+        subset.failedSymbols = source.failedSymbols;
+        subset.columns.reserve(symbolMappings.size());
+        subset.sourceNames.reserve(symbolMappings.size());
+        for (std::size_t column = 0; column < source.columns.size(); ++column) {
+            if (column == groupPathColumn) continue;
+            subset.columns.push_back(source.columns[column]);
+            if (column < source.sourceNames.size()) subset.sourceNames.push_back(source.sourceNames[column]);
+        }
+        subset.rows.reserve(selectedRows.size());
+        for (const std::size_t rowIndex : selectedRows) {
+            if (rowIndex >= source.rows.size()) continue;
+            std::vector<std::wstring> row;
+            row.reserve(symbolMappings.size());
+            for (std::size_t column = 0; column < source.rows[rowIndex].size(); ++column) {
+                if (column != groupPathColumn) row.push_back(source.rows[rowIndex][column]);
+            }
+            subset.rows.push_back(std::move(row));
+        }
+        return subset;
+    };
+
+    std::error_code fsError;
+    std::filesystem::create_directories(std::filesystem::path(backupDirectory), fsError);
+    if (fsError || !std::filesystem::is_directory(std::filesystem::path(backupDirectory), fsError)) {
+        error = L"Cannot create the backup directory: " + backupDirectory;
+        return false;
+    }
+    result.backupPath = backupFilePath(backupDirectory);
+    if (!saveSnapshotCsv(baselineSnapshot, result.backupPath, error)) return false;
+    const std::wstring combinedBackupPath = result.backupPath;
+
+    const std::size_t totalRows = importedSnapshot.rows.size();
+    std::size_t processedRows = 0;
+    std::vector<std::pair<std::wstring, std::vector<std::size_t>>> completedGroups;
+    for (const std::wstring& groupPath : groupOrder) {
+        const std::vector<std::size_t>& rowIndices = importedRowsByGroup[groupPath];
+        if (checkpoint) {
+            const ApplyChoice choice = checkpoint({processedRows, totalRows, false, groupPath});
+            if (choice != ApplyChoice::Continue) {
+                result.aborted = true;
+                result.restoreRequested = choice == ApplyChoice::StopAndRestore;
+                result.notProcessed = totalRows - processedRows;
+                break;
+            }
+        }
+
+        SymbolSnapshot groupImport = makeGroupSnapshot(importedSnapshot, rowIndices);
+        std::unordered_set<std::wstring> groupRowKeys;
+        groupRowKeys.reserve(rowIndices.size());
+        for (const std::size_t rowIndex : rowIndices) {
+            if (rowIndex < importedSnapshot.rows.size()) {
+                groupRowKeys.insert(compositeKey(importedSnapshot.rows[rowIndex],
+                    groupPathColumn, symbolColumn));
+            }
+        }
+        std::vector<std::size_t> baselineRowIndices;
+        baselineRowIndices.reserve(rowIndices.size());
+        for (std::size_t rowIndex = 0; rowIndex < baselineSnapshot.rows.size(); ++rowIndex) {
+            if (groupRowKeys.contains(compositeKey(baselineSnapshot.rows[rowIndex],
+                    groupPathColumn, symbolColumn))) {
+                baselineRowIndices.push_back(rowIndex);
+            }
+        }
+        SymbolSnapshot groupBaseline = makeGroupSnapshot(baselineSnapshot, baselineRowIndices);
+        const std::size_t groupOffset = processedRows;
+        const std::size_t groupRowCount = rowIndices.size();
+        const ApplyCheckpoint groupCheckpoint = [&, groupOffset, groupRowCount](const ApplyProgress& local) {
+            if (!checkpoint) return ApplyChoice::Continue;
+            const std::size_t localRows = local.total == 0 ? 0 :
+                (std::min)(groupRowCount, local.completed * groupRowCount / local.total);
+            return checkpoint({groupOffset + localRows, totalRows, local.restoring, local.symbol});
+        };
+
+        ApplyResult groupResult;
+        std::wstring groupError;
+        const bool groupSuccess = applyImportedSingleGroupSymbolSnapshot(server, loginText,
+            password, groupPath, symbolMappings, groupImport, backupDirectory,
+            groupCheckpoint, groupResult, groupError);
+        if (!groupSuccess) {
+            error = L"Group '" + groupPath + L"': " + groupError;
+            result.failed += groupResult.failed;
+            result.backupPath = combinedBackupPath;
+            return false;
+        }
+        result.applied += groupResult.applied;
+        result.unchanged += groupResult.unchanged;
+        result.failed += groupResult.failed;
+        result.skipped += groupResult.skipped;
+        result.notProcessed += groupResult.notProcessed;
+        result.restored += groupResult.restored;
+        result.restoreFailed += groupResult.restoreFailed;
+        result.aborted = groupResult.aborted;
+        result.restoreRequested = groupResult.restoreRequested;
+        if (result.firstFailure.empty()) result.firstFailure = groupResult.firstFailure;
+        result.backupPath = combinedBackupPath;
+
+        if (groupResult.applied != 0 || groupResult.failed != 0) {
+            completedGroups.emplace_back(groupPath, rowIndices);
+        }
+        processedRows += groupRowCount;
+        if (groupResult.aborted) {
+            result.notProcessed += totalRows - processedRows;
+            break;
+        }
+    }
+
+    if (result.restoreRequested && !completedGroups.empty()) {
+        std::size_t restoredRows = 0;
+        for (std::size_t offset = 0; offset < completedGroups.size(); ++offset) {
+            const auto& [groupPath, rowIndices] = completedGroups[completedGroups.size() - 1 - offset];
+            std::unordered_set<std::wstring> groupRowKeys;
+            groupRowKeys.reserve(rowIndices.size());
+            for (const std::size_t rowIndex : rowIndices) {
+                if (rowIndex < importedSnapshot.rows.size()) {
+                    groupRowKeys.insert(compositeKey(importedSnapshot.rows[rowIndex],
+                        groupPathColumn, symbolColumn));
+                }
+            }
+            std::vector<std::size_t> baselineRowIndices;
+            for (std::size_t rowIndex = 0; rowIndex < baselineSnapshot.rows.size(); ++rowIndex) {
+                if (groupRowKeys.contains(compositeKey(baselineSnapshot.rows[rowIndex],
+                        groupPathColumn, symbolColumn))) {
+                    baselineRowIndices.push_back(rowIndex);
+                }
+            }
+            SymbolSnapshot groupBaseline = makeGroupSnapshot(baselineSnapshot, baselineRowIndices);
+            ApplyResult restoreResult;
+            std::wstring restoreError;
+            const ApplyCheckpoint restoreCheckpoint = [&](const ApplyProgress& local) {
+                if (!checkpoint) return ApplyChoice::Continue;
+                return checkpoint({restoredRows + local.completed,
+                    (std::max)(completedGroups.size(), std::size_t{1}), true, local.symbol});
+            };
+            if (!groupBaseline.rows.empty() &&
+                applyImportedSingleGroupSymbolSnapshot(server, loginText, password,
+                    groupPath, symbolMappings, groupBaseline, backupDirectory,
+                    restoreCheckpoint, restoreResult, restoreError)) {
+                result.restored += restoreResult.applied + restoreResult.restored;
+                result.restoreFailed += restoreResult.failed + restoreResult.restoreFailed;
+                if (result.firstFailure.empty()) result.firstFailure = restoreResult.firstFailure;
+            } else {
+                ++result.restoreFailed;
+                if (result.firstFailure.empty()) {
+                    result.firstFailure = L"Could not restore group '" + groupPath + L"': " + restoreError;
+                }
+            }
+            restoredRows += rowIndices.size();
+        }
+    }
+    result.backupPath = combinedBackupPath;
     return true;
 }

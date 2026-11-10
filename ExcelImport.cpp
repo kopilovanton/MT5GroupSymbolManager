@@ -201,7 +201,7 @@ bool validateWorkbookArchive(const std::wstring& path,
     if (std::none_of(entries.begin(), entries.end(), [](const ZipEntry& entry) {
             return worksheetPartName(entry.name);
         })) {
-        error = L"The workbook's first sheet is missing. Import an Excel file exported by MT5 Symbol Manager.";
+        error = L"The workbook's first sheet is missing. Import an Excel file exported by MT5 Group Symbol Manager.";
         return false;
     }
     return true;
