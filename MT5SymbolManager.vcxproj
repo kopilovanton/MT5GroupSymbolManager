@@ -43,7 +43,7 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>C:\Program Files\MetaTrader5SDK\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)MT5SDK\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
@@ -57,10 +57,10 @@
     <ClCompile Include="SymbolSnapshot.cpp" />
     <ClCompile Include="ExcelExport.cpp" />
     <ClCompile Include="ExcelImport.cpp">
-      <AdditionalIncludeDirectories>C:\Program Files\MetaTrader5SDK\Examples\Report\NFA.Reports\Tools\Zip;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)MT5SDK\Examples\Report\NFA.Reports\Tools\Zip;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
-    <ClCompile Include="C:\Program Files\MetaTrader5SDK\Examples\Report\NFA.Reports\Tools\Zip\ZLib.cpp">
-      <AdditionalIncludeDirectories>C:\Program Files\MetaTrader5SDK\Examples\Report\NFA.Reports;C:\Program Files\MetaTrader5SDK\Examples\Report\NFA.Reports\Tools\Zip;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    <ClCompile Include="$(ProjectDir)MT5SDK\Examples\Report\NFA.Reports\Tools\Zip\ZLib.cpp">
+      <AdditionalIncludeDirectories>$(ProjectDir)MT5SDK\Examples\Report\NFA.Reports;$(ProjectDir)MT5SDK\Examples\Report\NFA.Reports\Tools\Zip;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <DisableSpecificWarnings>4100;4127;4310;4244;%(DisableSpecificWarnings)</DisableSpecificWarnings>
     </ClCompile>
   </ItemGroup>
@@ -79,7 +79,7 @@
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <Target Name="CopyMt5RuntimeDll" AfterTargets="Build">
-    <Copy SourceFiles="C:\Program Files\MetaTrader5SDK\Libs\MT5APIManager64.dll"
+    <Copy SourceFiles="$(ProjectDir)MT5SDK\Libs\MT5APIManager64.dll"
           DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
     <Copy SourceFiles="$(ProjectDir)symbols.ini"
           DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />

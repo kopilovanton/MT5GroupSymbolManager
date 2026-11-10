@@ -59,8 +59,8 @@ code mappings.
 
 ## Build
 
-Build the x64 configuration with Visual Studio 2026 and the MetaTrader 5 SDK
-installed at `C:\Program Files\MetaTrader5SDK`. The build copies only the
-native `MT5APIManager64.dll` beside the executable. XLSX import also compiles
-the ZIP inflater from the SDK's `Examples\Report\NFA.Reports\Tools\Zip` folder;
-it is linked into the executable and adds no runtime DLL dependency.
+Build the x64 configuration with Visual Studio 2026 using the SDK files kept in
+the project's `MT5SDK` folder. The build copies `MT5SDK\Libs\MT5APIManager64.dll`
+beside the executable. XLSX import compiles the ZIP inflater from
+`MT5SDK\Examples\Report\NFA.Reports\Tools\Zip`; it is linked into the
+executable and adds no runtime DLL dependency.
