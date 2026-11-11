@@ -873,7 +873,7 @@ std::wstring sdkConstraintForField(std::wstring_view sourceName) {
     if (sourceName == L"Industry") return L"|||0,1..14,51..57,101..123,151..162,201..208,251..269,301..311,351..375,401..412,451..462,501..506,551..554";
     if (sourceName == L"CalcMode") return L"|||0..5,32..39,64";
     if (sourceName == L"TradeMode") return L"|||0..4";
-    if (sourceName == L"ExecMode") return L"|||0..5,32..39,64";
+    if (sourceName == L"ExecMode") return L"|||0..3";
     if (sourceName == L"GTCMode") return L"|||0..2";
     if (sourceName == L"FillFlags") return L"0|7||";
     if (sourceName == L"ExpirFlags") return L"0|15||";
@@ -911,6 +911,7 @@ std::wstring sdkConstraintForField(std::wstring_view sourceName) {
 
 std::wstring sdkConstraintForGroupField(std::wstring_view sourceName) {
     if (sourceName == L"Path") return L"|||";
+    if (sourceName == L"ExecMode") return L"|||0..3";
     if (sourceName == L"SpreadDiff" || sourceName == L"SpreadDiffBalance" ||
         sourceName == L"StopsLevel" || sourceName == L"FreezeLevel") {
         return L"-2147483648|2147483647||";
@@ -945,9 +946,102 @@ void writeDefaultGroupSymbolConfig(std::ostream& output,
         output << encodeUtf8(mapping.sourceName) << '=' <<
             encodeUtf8(sdkConstraintForGroupField(mapping.sourceName)) << '\n';
     }
-    output << "\n# Group-specific map sections override matching ValueMap./FlagMap. entries above.\n"
-              "# Examples: [GroupValueMap.TradeMode], [GroupFlagMap.FillFlags].\n"
-              "# Map entries use the same code=label format as ValueMap and FlagMap.\n";
+}
+
+void writeDefaultGroupValueMaps(std::ostream& output) {
+    output << "\n# Display labels for group-symbol enum and flag values.\n"
+              "[ValueMap.ExecMode]\n"
+              "0=Request\n"
+              "1=Instant\n"
+              "2=Market\n"
+              "3=Exchange\n"
+              "\n[ValueMap.TradeMode]\n"
+              "0=Disabled\n"
+              "1=Long only\n"
+              "2=Short only\n"
+              "3=Close only\n"
+              "4=Full access\n"
+              "\n[ValueMap.SwapMode]\n"
+              "0=Disabled\n"
+              "1=Points\n"
+              "2=Symbol currency\n"
+              "3=Margin currency\n"
+              "4=Group currency\n"
+              "5=Interest current\n"
+              "6=Interest open\n"
+              "7=Reopen by close price\n"
+              "8=Reopen by bid\n"
+              "9=Profit currency\n"
+              "\n[ValueMap.Swap3Day]\n"
+              "0=Sunday\n"
+              "1=Monday\n"
+              "2=Tuesday\n"
+              "3=Wednesday\n"
+              "4=Thursday\n"
+              "5=Friday\n"
+              "6=Saturday\n"
+              "7=Disabled\n"
+              "\n[ValueMap.IECheckMode]\n"
+              "0=Normal\n"
+              "\n[FlagMap.FillFlags]\n"
+              "0=None\n"
+              "1=FOK\n"
+              "2=IOC\n"
+              "4=BOC\n"
+              "\n[FlagMap.ExpirFlags]\n"
+              "0=None\n"
+              "1=GTC\n"
+              "2=Day\n"
+              "4=Specified\n"
+              "8=Specified day\n"
+              "\n[FlagMap.OrderFlags]\n"
+              "0=None\n"
+              "1=Market\n"
+              "2=Limit\n"
+              "4=Stop\n"
+              "8=Stop limit\n"
+              "16=SL\n"
+              "32=TP\n"
+              "64=Close by\n"
+              "\n[FlagMap.MarginFlags]\n"
+              "0=None\n"
+              "1=Check process\n"
+              "2=Check SL/TP\n"
+              "4=Hedge large leg\n"
+              "8=Exclude P/L\n"
+              "16=Recalculate rates\n"
+              "\n[FlagMap.REFlags]\n"
+              "0=None\n"
+              "1=Order confirmation\n"
+              "\n[FlagMap.PermissionsFlags]\n"
+              "0=None\n"
+              "1=Allow books\n"
+              "\n[FlagMap.IEFlags]\n"
+              "0=None\n"
+              "1=Fast confirmation\n"
+              "\n[FlagMap.SwapFlags]\n"
+              "0=None\n"
+              "1=Consider holidays\n";
+}
+
+bool writeDefaultGroupOnlyConfig(const std::wstring& path,
+                                 const std::vector<SymbolFieldMapping>& groupMappings,
+                                 std::wstring& error) {
+    std::ofstream output(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
+    if (!output) {
+        error = L"Cannot create group symbol field configuration: " + path;
+        return false;
+    }
+    output << "# MT5 Group Symbol Manager field configuration.\n"
+              "# Configure group columns, constraints, and displayed enum or flag labels below.\n";
+    writeDefaultGroupSymbolConfig(output, groupMappings);
+    writeDefaultGroupValueMaps(output);
+    output.close();
+    if (!output) {
+        error = L"Cannot write group symbol field configuration: " + path;
+        return false;
+    }
+    return true;
 }
 
 std::wstring serverValueForField(const SymbolFieldMapping& mapping,
@@ -2363,8 +2457,20 @@ bool LoadGroupSymbolFieldMappings(const std::wstring& path,
 
     std::ifstream input(std::filesystem::path(path), std::ios::binary);
     if (!input) {
-        error = L"Cannot read group symbol field configuration: " + path;
-        return false;
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        const DWORD attributesError = GetLastError();
+        if (attributes != INVALID_FILE_ATTRIBUTES ||
+            (attributesError != ERROR_FILE_NOT_FOUND && attributesError != ERROR_PATH_NOT_FOUND)) {
+            error = L"Cannot read group symbol field configuration: " + path;
+            return false;
+        }
+        if (!writeDefaultGroupOnlyConfig(path, defaults, error)) return false;
+        input.clear();
+        input.open(std::filesystem::path(path), std::ios::binary);
+        if (!input) {
+            error = L"Cannot read group symbol field configuration: " + path;
+            return false;
+        }
     }
     std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     if (bytes.size() > 1024 * 1024) {
@@ -2383,8 +2489,7 @@ bool LoadGroupSymbolFieldMappings(const std::wstring& path,
         content = decodeUtf8(bytes);
     }
 
-    enum class Section { Ignore, Fields, Constraints, Value, Flag, Text,
-                         GroupValue, GroupFlag, GroupText };
+    enum class Section { Ignore, Fields, Constraints, Value, Flag, Text };
     Section section = Section::Ignore;
     std::wstring activeSource;
     bool dividerPending = false;
@@ -2398,7 +2503,6 @@ bool LoadGroupSymbolFieldMappings(const std::wstring& path,
     std::unordered_map<std::wstring, SymbolValueConstraint> constraints;
     using MapEntries = std::vector<std::pair<std::wstring, std::wstring>>;
     std::unordered_map<std::wstring, MapEntries> commonValues, commonFlags, commonTexts;
-    std::unordered_map<std::wstring, MapEntries> groupValues, groupFlags, groupTexts;
 
     while (start <= content.size()) {
         ++lineNumber;
@@ -2418,29 +2522,19 @@ bool LoadGroupSymbolFieldMappings(const std::wstring& path,
             } else if (name == L"GroupConstraints") {
                 section = Section::Constraints;
             } else {
-                struct Prefix { std::wstring_view text; Section section; bool groupSpecific; };
+                struct Prefix { std::wstring_view text; Section section; };
                 static constexpr Prefix prefixes[] = {
-                    {L"ValueMap.", Section::Value, false},
-                    {L"FlagMap.", Section::Flag, false},
-                    {L"TextMap.", Section::Text, false},
-                    {L"GroupValueMap.", Section::GroupValue, true},
-                    {L"GroupFlagMap.", Section::GroupFlag, true},
-                    {L"GroupTextMap.", Section::GroupText, true}
+                    {L"ValueMap.", Section::Value},
+                    {L"FlagMap.", Section::Flag},
+                    {L"TextMap.", Section::Text}
                 };
                 section = Section::Ignore;
                 for (const Prefix& prefix : prefixes) {
                     if (name.rfind(prefix.text, 0) != 0 || name.size() <= prefix.text.size()) continue;
                     const std::wstring requested = trim(name.substr(prefix.text.size()));
-                    if (!isKnownField(requested)) {
-                        if (prefix.groupSpecific) {
-                            error = L"Unknown group-symbol map field '" + requested + L"' on line " +
-                                std::to_wstring(lineNumber) + L" in " + path;
-                            return false;
-                        }
-                        break;
-                    }
-                    const std::wstring key = (prefix.groupSpecific ? L"Group." : L"Common.") + requested;
-                    if (!seenMapSections.insert(key + L"." + std::to_wstring(static_cast<int>(prefix.section))).second) {
+                    if (!isKnownField(requested)) break;
+                    if (!seenMapSections.insert(requested + L"." +
+                        std::to_wstring(static_cast<int>(prefix.section))).second) {
                         error = L"Duplicate group-symbol map section for '" + requested + L"' in " + path;
                         return false;
                     }
@@ -2510,8 +2604,7 @@ bool LoadGroupSymbolFieldMappings(const std::wstring& path,
                 return false;
             }
             constraints.emplace(sourceName, std::move(constraint));
-        } else if (section == Section::Value || section == Section::Flag || section == Section::Text ||
-                   section == Section::GroupValue || section == Section::GroupFlag || section == Section::GroupText) {
+        } else if (section == Section::Value || section == Section::Flag || section == Section::Text) {
             const std::size_t equals = line.find(L'=');
             if (equals == std::wstring::npos) {
                 error = L"Expected code=display label on line " + std::to_wstring(lineNumber) + L" in " + path;
@@ -2520,7 +2613,7 @@ bool LoadGroupSymbolFieldMappings(const std::wstring& path,
             const std::wstring codeText = trim(line.substr(0, equals));
             const std::wstring label = trim(line.substr(equals + 1));
             std::wstring code;
-            const bool isTextMap = section == Section::Text || section == Section::GroupText;
+            const bool isTextMap = section == Section::Text;
             if (!(isTextMap ? canonicalAlpha3Code(codeText, code) : canonicalValueCode(codeText, code)) || label.empty()) {
                 error = L"Invalid code or label in group-symbol map on line " +
                     std::to_wstring(lineNumber) + L" in " + path;
@@ -2531,9 +2624,6 @@ bool LoadGroupSymbolFieldMappings(const std::wstring& path,
             case Section::Value: entries = &commonValues[activeSource]; break;
             case Section::Flag: entries = &commonFlags[activeSource]; break;
             case Section::Text: entries = &commonTexts[activeSource]; break;
-            case Section::GroupValue: entries = &groupValues[activeSource]; break;
-            case Section::GroupFlag: entries = &groupFlags[activeSource]; break;
-            case Section::GroupText: entries = &groupTexts[activeSource]; break;
             default: break;
             }
             const bool duplicateCode = std::any_of(entries->begin(), entries->end(),
@@ -2565,22 +2655,12 @@ bool LoadGroupSymbolFieldMappings(const std::wstring& path,
     };
     ensurePath();
 
-    const auto mergeMaps = [](const MapEntries& common, const MapEntries& specific) {
-        MapEntries result = common;
-        for (const auto& item : specific) {
-            const auto existing = std::find_if(result.begin(), result.end(),
-                [&item](const auto& candidate) { return candidate.first == item.first; });
-            if (existing == result.end()) result.push_back(item);
-            else existing->second = item.second;
-        }
-        return result;
-    };
     for (SymbolFieldMapping& mapping : mappings) {
         const auto constraint = constraints.find(mapping.sourceName);
         if (constraint != constraints.end()) mapping.constraint = constraint->second;
-        mapping.valueMappings = mergeMaps(commonValues[mapping.sourceName], groupValues[mapping.sourceName]);
-        mapping.flagMappings = mergeMaps(commonFlags[mapping.sourceName], groupFlags[mapping.sourceName]);
-        mapping.textMappings = mergeMaps(commonTexts[mapping.sourceName], groupTexts[mapping.sourceName]);
+        mapping.valueMappings = commonValues[mapping.sourceName];
+        mapping.flagMappings = commonFlags[mapping.sourceName];
+        mapping.textMappings = commonTexts[mapping.sourceName];
     }
     return true;
 }

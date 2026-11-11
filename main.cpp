@@ -2715,12 +2715,22 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
         profiles.clear();
     }
     bool symbolConfigCreated = false;
-    symbolFieldConfigReady = LoadSymbolFieldMappings(symbolConfigPath, symbolFieldMappings,
-        symbolConfigCreated, symbolFieldConfigError);
-    if (symbolFieldConfigReady &&
-        !LoadGroupSymbolFieldMappings(symbolConfigPath, groupSymbolFieldMappings,
-            symbolFieldConfigError)) {
-        symbolFieldConfigReady = false;
+    if constexpr (temporaryViewMode == TemporaryViewMode::GroupSymbolPaths) {
+        const DWORD symbolConfigAttributes = GetFileAttributesW(symbolConfigPath.c_str());
+        const DWORD symbolConfigAttributesError = GetLastError();
+        symbolConfigCreated = symbolConfigAttributes == INVALID_FILE_ATTRIBUTES &&
+            (symbolConfigAttributesError == ERROR_FILE_NOT_FOUND ||
+             symbolConfigAttributesError == ERROR_PATH_NOT_FOUND);
+        symbolFieldConfigReady = LoadGroupSymbolFieldMappings(symbolConfigPath,
+            groupSymbolFieldMappings, symbolFieldConfigError);
+    } else {
+        symbolFieldConfigReady = LoadSymbolFieldMappings(symbolConfigPath, symbolFieldMappings,
+            symbolConfigCreated, symbolFieldConfigError);
+        if (symbolFieldConfigReady &&
+            !LoadGroupSymbolFieldMappings(symbolConfigPath, groupSymbolFieldMappings,
+                symbolFieldConfigError)) {
+            symbolFieldConfigReady = false;
+        }
     }
 
     WNDCLASSEXW windowClass{};
@@ -2874,7 +2884,7 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
     if (!symbolFieldConfigReady) {
         setStatus(symbolFieldConfigError);
     } else if (symbolConfigCreated) {
-        setStatus(L"Created " + symbolConfigPath + L" with all available symbol fields.");
+        setStatus(L"Created " + symbolConfigPath + L" with group symbol fields and constraints.");
     }
 
     ShowWindow(mainWindow, showCommand);
@@ -2886,10 +2896,9 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
                 L"\nEdit it with your MT5 server, login, and password, then restart the application.\n\n";
         }
         if (symbolConfigCreated) {
-            notice += L"Created the symbol field configuration:\n" + symbolConfigPath +
-                L"\nEdit the right side of each SourceField=ColumnHeading line to rename columns. "
-                L"Line order controls the table and Excel export order.\n"
-                L"Remove lines for fields you do not need.";
+            notice += L"Created the group symbol configuration:\n" + symbolConfigPath +
+                L"\nEdit [GroupSymbolFields] to rename and reorder group columns. "
+                L"[GroupConstraints] controls value limits, and ValueMap/FlagMap sections set display labels.";
         }
         MessageBoxW(mainWindow, notice.c_str(), L"Configuration files created",
             MB_OK | MB_ICONINFORMATION);

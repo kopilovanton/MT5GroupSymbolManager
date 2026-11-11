@@ -42,39 +42,22 @@ login=123456
 password=replace_me
 ```
 
-## Symbol fields
+## Group symbol fields
 
-The app reads `symbols.ini` beside the executable. Each line maps an SDK field
-name to a table heading, for example `Description=Instrument description`.
-The order of mappings sets the column order in the table and Excel export.
-Remove a mapping line to omit that field. On first launch, the app creates a
-file containing every supported field with its original name as the heading.
+The app reads the group-specific `symbols.ini` beside the executable. It
+contains three kinds of settings: `[GroupSymbolFields]` controls group-table
+columns and their order; `[GroupConstraints]` defines
+`minimum|maximum|maxChars|allowedValues`; and `[ValueMap.<field>]`,
+`[FlagMap.<field>]`, or `[TextMap.<field>]` sections provide display labels.
+Blank lines between field mappings create vertical dividers. The `Path` field
+is retained as the symbol path, while `Group Path` is always shown first.
 
-`[GroupSymbolFields]` controls the columns for settings stored in each group's
-`Symbol` list. Its order and headings work the same way; `Path` is retained as
-the symbol path, while `Group Path` is always shown first. Blank lines create
-vertical dividers. `[GroupConstraints]` has the same
-`minimum|maximum|maxChars|allowedValues` format for these fields. The SDK-backed
-enum, flag, and integer bounds are prefilled where defined; blank slots are
-templates for limits the SDK does not specify.
-
-Optional `[ValueMap.<SDK field>]` sections map numeric enum values to labels,
-for example `[ValueMap.BookVolumeMode]` with `0=Default`, `1=Amounts`, and
-`2=Lots`. `[FlagMap.<SDK field>]` sections map zero, individual bits, or exact
-combined values. Exact matches take precedence; otherwise known individual bits
-display as labels joined by ` | `. `[TextMap.<SDK field>]`
-sections map text codes to labels; `[TextMap.Country]` contains ISO 3166-1
-alpha-3 codes such as `USA=United States`.
-`[GroupValueMap.<field>]`, `[GroupFlagMap.<field>]`, and
-`[GroupTextMap.<field>]` can override value labels specifically for group
-settings. When no group-specific map is present, matching `ValueMap`, `FlagMap`,
-or `TextMap` entries are reused.
-
-The app keeps unmapped enum codes and unknown flag combinations numeric, and
-passes unknown text values through unchanged. Excel import accepts configured
-labels or codes; labels are converted back to their SDK values before applying.
-The shipped and first-launch defaults include the SDK's enum, flag, and country
-code mappings.
+SDK-backed limits are filled in where defined; other constraint slots are
+templates. The app keeps unmapped enum values and unknown flag combinations
+numeric. Group `ExecMode` uses `[ValueMap.ExecMode]` with the execution labels
+`Request`, `Instant`, `Market`, and `Exchange`. On first launch, the app creates a configuration
+containing only group-symbol fields, constraints, and their relevant label
+maps.
 
 ## Build
 

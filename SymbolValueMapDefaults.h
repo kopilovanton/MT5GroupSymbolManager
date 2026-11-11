@@ -217,21 +217,10 @@ inline constexpr char kDefaultSymbolValueMaps[] = R"SYMBOLMAPS(
 64=Collateral
 
 [ValueMap.ExecMode]
-0=Forex
-1=Futures
-2=CFD
-3=CFD index
-4=CFD leverage
-5=Forex no leverage
-32=Exchange stocks
-33=Exchange futures
-34=Exchange futures FORTS
-35=Exchange options
-36=Exchange options margin
-37=Exchange bonds
-38=Exchange stocks MOEX
-39=Exchange bonds MOEX
-64=Collateral
+0=Request
+1=Instant
+2=Market
+3=Exchange
 
 [ValueMap.GTCMode]
 0=GTC
