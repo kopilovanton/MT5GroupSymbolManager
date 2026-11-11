@@ -54,6 +54,8 @@ struct SymbolFieldMapping {
     std::vector<std::pair<std::wstring, std::wstring>> textMappings;
     SymbolFieldValueKind valueKind = SymbolFieldValueKind::Text;
     SymbolValueConstraint constraint;
+    // Group fields whose SDK representation uses a typed maximum as "inherit symbol value".
+    bool supportsDefault = false;
 };
 
 enum class ApplyChoice {

@@ -98,8 +98,7 @@ enum class TemporaryViewMode {
     AllGroupSymbolParameters
 };
 
-// Set to AllGroupSymbolParameters to restore the full symbol-parameter view.
-constexpr TemporaryViewMode temporaryViewMode = TemporaryViewMode::GroupSymbolPaths;
+constexpr TemporaryViewMode temporaryViewMode = TemporaryViewMode::AllGroupSymbolParameters;
 
 struct ImportLoadResult {
     bool success = false;
@@ -161,7 +160,6 @@ HFONT controlFont = nullptr;
 HFONT statusFont = nullptr;
 HFONT tableFont = nullptr;
 std::vector<ConnectionProfile> profiles;
-std::vector<SymbolFieldMapping> symbolFieldMappings;
 std::vector<SymbolFieldMapping> groupSymbolFieldMappings;
 bool symbolFieldConfigReady = false;
 std::wstring symbolFieldConfigError;
@@ -515,14 +513,9 @@ std::wstring_view rowCellValue(const std::vector<std::wstring>& row, std::size_t
 }
 
 const SymbolFieldMapping* displayMappingForSource(const std::wstring& sourceName) {
-    if constexpr (temporaryViewMode == TemporaryViewMode::GroupSymbolPaths) {
-        const auto groupMapping = std::find_if(groupSymbolFieldMappings.begin(), groupSymbolFieldMappings.end(),
-            [&sourceName](const SymbolFieldMapping& field) { return field.sourceName == sourceName; });
-        if (groupMapping != groupSymbolFieldMappings.end()) return &*groupMapping;
-    }
-    const auto symbolMapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
+    const auto groupMapping = std::find_if(groupSymbolFieldMappings.begin(), groupSymbolFieldMappings.end(),
         [&sourceName](const SymbolFieldMapping& field) { return field.sourceName == sourceName; });
-    return symbolMapping == symbolFieldMappings.end() ? nullptr : &*symbolMapping;
+    return groupMapping == groupSymbolFieldMappings.end() ? nullptr : &*groupMapping;
 }
 
 void rebuildDisplayRows() {
@@ -542,9 +535,12 @@ std::wstring_view displayCellValue(std::size_t row, std::size_t column) {
 }
 
 std::size_t findSymbolColumn(const SymbolSnapshot& snapshot) {
+    std::size_t pathColumn = (std::numeric_limits<std::size_t>::max)();
     for (std::size_t column = 0; column < snapshot.sourceNames.size(); ++column) {
         if (snapshot.sourceNames[column] == L"Symbol") return column;
+        if (snapshot.sourceNames[column] == L"Path") pathColumn = column;
     }
+    if (pathColumn != (std::numeric_limits<std::size_t>::max)()) return pathColumn;
     constexpr std::wstring_view suffix = L".Symbol";
     for (std::size_t column = 0; column < snapshot.columns.size(); ++column) {
         const std::wstring& name = snapshot.columns[column];
@@ -653,6 +649,14 @@ void preserveImportedPathValues(SymbolSnapshot& imported, const SymbolSnapshot& 
     for (std::size_t column = 0; column < imported.sourceNames.size(); ++column) {
         if (imported.sourceNames[column] == L"Symbol") importedSymbolColumn = column;
         if (imported.sourceNames[column] == L"Path") importedPathColumn = column;
+    }
+    if (importedPathColumn != (std::numeric_limits<std::size_t>::max)() &&
+        importedSymbolColumn == (std::numeric_limits<std::size_t>::max)() &&
+        findSymbolColumn(imported) == importedPathColumn) {
+        // In group-rule workbooks, Path is the configured Symbol rule itself and
+        // is the row identity. Preserve it verbatim instead of treating it as a
+        // secondary symbol-path value to be reconstructed.
+        return;
     }
     for (std::size_t column = 0; column < server.sourceNames.size(); ++column) {
         if (server.sourceNames[column] == L"Symbol") serverSymbolColumn = column;
@@ -1062,9 +1066,8 @@ bool cellValueError(std::size_t rowIndex, std::size_t columnIndex,
     if (columnIndex >= currentSnapshot.sourceNames.size() ||
         rowIndex >= currentSnapshot.rows.size()) return false;
     const std::wstring& sourceName = currentSnapshot.sourceNames[columnIndex];
-    const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
-        [&sourceName](const SymbolFieldMapping& field) { return field.sourceName == sourceName; });
-    if (mapping == symbolFieldMappings.end()) return false;
+    const SymbolFieldMapping* mapping = displayMappingForSource(sourceName);
+    if (!mapping) return false;
     const std::wstring storageValue = SymbolValueForStorage(*mapping, std::wstring(value));
     return !ValidateSymbolFieldValue(*mapping, storageValue, error);
 }
@@ -1075,10 +1078,7 @@ void rebuildInvalidCellMap() {
 
     std::vector<const SymbolFieldMapping*> mappingsByColumn(currentSnapshot.sourceNames.size(), nullptr);
     for (std::size_t column = 0; column < currentSnapshot.sourceNames.size(); ++column) {
-        const std::wstring& sourceName = currentSnapshot.sourceNames[column];
-        const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
-            [&sourceName](const SymbolFieldMapping& field) { return field.sourceName == sourceName; });
-        if (mapping != symbolFieldMappings.end()) mappingsByColumn[column] = &*mapping;
+        mappingsByColumn[column] = displayMappingForSource(currentSnapshot.sourceNames[column]);
     }
 
     for (std::size_t row = 0; row < currentSnapshot.rows.size(); ++row) {
@@ -1139,9 +1139,8 @@ std::wstring firstInvalidCellMessage() {
         for (const std::size_t column : invalid->second) {
             if (column >= currentSnapshot.sourceNames.size() || column >= row.size()) continue;
             const std::wstring& sourceName = currentSnapshot.sourceNames[column];
-            const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
-                [&sourceName](const SymbolFieldMapping& field) { return field.sourceName == sourceName; });
-            if (mapping == symbolFieldMappings.end()) continue;
+            const SymbolFieldMapping* mapping = displayMappingForSource(sourceName);
+            if (!mapping) continue;
             std::wstring validationError;
             const std::wstring storageValue = SymbolValueForStorage(*mapping, row[column]);
             if (ValidateSymbolFieldValue(*mapping, storageValue, validationError)) continue;
@@ -1169,9 +1168,7 @@ void updateExportButton() {
         EnableWindow(exportButton, !operationRunning.load() && !currentSnapshot.columns.empty());
     }
     if (applyButton) {
-        EnableWindow(applyButton,
-            temporaryViewMode == TemporaryViewMode::AllGroupSymbolParameters &&
-            !operationRunning.load() && hasPendingSymbolChanges() &&
+        EnableWindow(applyButton, !operationRunning.load() && hasPendingSymbolChanges() &&
             !hasInvalidCellValues());
     }
     if (browseExcelButton) {
@@ -1224,13 +1221,9 @@ void finishCellEdit(bool commit) {
 
     std::wstring normalizedValue = value;
     if (columnIndex < currentSnapshot.sourceNames.size()) {
-        const auto mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
-            [sourceName = currentSnapshot.sourceNames[columnIndex]](const SymbolFieldMapping& field) {
-                return field.sourceName == sourceName;
-            });
-        if (mapping != symbolFieldMappings.end()) {
-            normalizedValue = SymbolValueForStorage(*mapping, normalizedValue);
-        }
+        const SymbolFieldMapping* mapping =
+            displayMappingForSource(currentSnapshot.sourceNames[columnIndex]);
+        if (mapping) normalizedValue = SymbolValueForStorage(*mapping, normalizedValue);
     }
     if (normalizedValue == currentSnapshot.rows[rowIndex][columnIndex]) {
         updateExportButton();
@@ -1394,14 +1387,6 @@ void addTableColumns() {
             });
         if (mapping != groupSymbolFieldMappings.end()) {
             dividerBeforeColumns[column] = mapping->dividerBefore;
-            continue;
-        }
-        mapping = std::find_if(symbolFieldMappings.begin(), symbolFieldMappings.end(),
-            [sourceName = currentSnapshot.sourceNames[column]](const SymbolFieldMapping& field) {
-                return field.sourceName == sourceName;
-            });
-        if (mapping != symbolFieldMappings.end()) {
-            dividerBeforeColumns[column] = mapping->dividerBefore;
         }
     }
     pinnedColumnIndices.clear();
@@ -1517,30 +1502,23 @@ void startFetch(bool preserveCurrentData = false) {
     setBusy(true);
     const wchar_t* retrievalDescription = temporaryViewMode == TemporaryViewMode::GroupSymbolPaths
         ? L" and retrieving configured Symbol paths for all groups..."
-        : L" and retrieving symbols for all groups...";
+        : L" and retrieving configured Symbol entries and their group parameters...";
     setStatus((preserveCurrentData ? L"Refreshing data from " : L"Connecting to ") +
         profile.name + retrievalDescription);
 
     const HWND window = mainWindow;
     const std::shared_ptr<AsyncState> state = asyncState;
-    const std::vector<SymbolFieldMapping> fieldMappings = symbolFieldMappings;
-    const std::vector<SymbolFieldMapping> groupFieldMappings = groupSymbolFieldMappings;
+    const std::vector<SymbolFieldMapping> fieldMappings = groupSymbolFieldMappings;
     try {
         fetchWorker = std::thread([window, state, profile = std::move(profile),
-                                   fieldMappings, groupFieldMappings]() mutable {
+                                   fieldMappings]() mutable {
         auto result = std::make_unique<FetchResult>();
         result->profile = profile.name;
         result->server = profile.server;
         try {
-            if constexpr (temporaryViewMode == TemporaryViewMode::GroupSymbolPaths) {
-                result->success = LoadGroupSymbolPathsSnapshot(profile.server, profile.login,
-                    profile.password, groupFieldMappings, result->groupNames,
-                    result->snapshot, result->error);
-            } else {
-                result->success = LoadGroupSymbolSnapshot(profile.server, profile.login,
-                    profile.password, fieldMappings, result->groupNames,
-                    result->snapshot, result->error);
-            }
+            result->success = LoadGroupSymbolPathsSnapshot(profile.server, profile.login,
+                profile.password, fieldMappings, result->groupNames,
+                result->snapshot, result->error);
         } catch (const std::exception& exception) {
             result->success = false;
             result->error = temporaryViewMode == TemporaryViewMode::GroupSymbolPaths
@@ -1625,10 +1603,10 @@ void showFetchResult() {
 
         std::wstring firstLine = L"Connected to " + result->profile + L" (" + result->server +
             L"). Retrieved " + std::to_wstring(currentSnapshot.rows.size()) +
-            L" symbol rows from " + std::to_wstring(groupsWithRows.size()) + L" of " +
+            L" configured Symbol entries from " + std::to_wstring(groupsWithRows.size()) + L" of " +
             std::to_wstring(result->groupNames.size()) + L" groups.";
         std::wstring secondLine = L"Parameters: " + std::to_wstring(currentSnapshot.columns.size()) +
-            L". Double-click editable values; Failed symbol records: " +
+            L". Double-click editable group values; Failed group or Symbol records: " +
             std::to_wstring(currentSnapshot.failedSymbols) + L".";
         if (currentSnapshot.failedSymbols != 0) {
             secondLine += L" The failed records were skipped.";
@@ -1716,6 +1694,9 @@ bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
             return false;
         }
         if (mappings[index].sourceName == L"Symbol") symbolColumn = index;
+        else if (mappings[index].sourceName == L"Path" && symbolColumn == mappings.size()) {
+            symbolColumn = index;
+        }
         if (mappings[index].sourceName == L"GroupPath") groupPathColumn = index;
     }
     if (symbolColumn == mappings.size()) {
@@ -1743,7 +1724,7 @@ bool normalizeImportedSnapshot(SymbolSnapshot& snapshot,
         inputColumnForMapping[expected->second] = inputColumn;
     }
     for (std::size_t index = 0; index < inputColumnForMapping.size(); ++index) {
-        if (inputColumnForMapping[index] == mappings.size() && mappings[index].sourceName != L"Path") {
+        if (inputColumnForMapping[index] == mappings.size()) {
             error = L"The workbook is missing column '" + mappings[index].displayName + L"'.";
             return false;
         }
@@ -1814,7 +1795,7 @@ void loadExcelWorkbook() {
     bool expected = false;
     if (!operationRunning.compare_exchange_strong(expected, true)) return;
     const std::wstring selectedPath(path.data());
-    const auto mappings = symbolFieldMappings;
+    const auto mappings = groupSymbolFieldMappings;
     const HWND window = mainWindow;
     const auto state = asyncState;
     setBusy(true);
@@ -1965,7 +1946,7 @@ void startApplyChanges() {
     setStatus(L"Creating a backup of effective symbol parameters across groups...");
     const auto state = applyAsyncState;
     const auto control = applyControlState;
-    const auto mappings = symbolFieldMappings;
+    const auto mappings = groupSymbolFieldMappings;
     const auto imported = currentSnapshot;
     const auto baseline = serverSnapshot;
     const std::wstring backupDirectory = executableDirectory + L"\\backup";
@@ -2715,23 +2696,13 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
         profiles.clear();
     }
     bool symbolConfigCreated = false;
-    if constexpr (temporaryViewMode == TemporaryViewMode::GroupSymbolPaths) {
-        const DWORD symbolConfigAttributes = GetFileAttributesW(symbolConfigPath.c_str());
-        const DWORD symbolConfigAttributesError = GetLastError();
-        symbolConfigCreated = symbolConfigAttributes == INVALID_FILE_ATTRIBUTES &&
-            (symbolConfigAttributesError == ERROR_FILE_NOT_FOUND ||
-             symbolConfigAttributesError == ERROR_PATH_NOT_FOUND);
-        symbolFieldConfigReady = LoadGroupSymbolFieldMappings(symbolConfigPath,
-            groupSymbolFieldMappings, symbolFieldConfigError);
-    } else {
-        symbolFieldConfigReady = LoadSymbolFieldMappings(symbolConfigPath, symbolFieldMappings,
-            symbolConfigCreated, symbolFieldConfigError);
-        if (symbolFieldConfigReady &&
-            !LoadGroupSymbolFieldMappings(symbolConfigPath, groupSymbolFieldMappings,
-                symbolFieldConfigError)) {
-            symbolFieldConfigReady = false;
-        }
-    }
+    const DWORD symbolConfigAttributes = GetFileAttributesW(symbolConfigPath.c_str());
+    const DWORD symbolConfigAttributesError = GetLastError();
+    symbolConfigCreated = symbolConfigAttributes == INVALID_FILE_ATTRIBUTES &&
+        (symbolConfigAttributesError == ERROR_FILE_NOT_FOUND ||
+         symbolConfigAttributesError == ERROR_PATH_NOT_FOUND);
+    symbolFieldConfigReady = LoadGroupSymbolFieldMappings(symbolConfigPath,
+        groupSymbolFieldMappings, symbolFieldConfigError);
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);

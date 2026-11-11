@@ -497,6 +497,11 @@ std::wstring trim(std::wstring value) {
     return value.substr(first, last - first + 1);
 }
 
+bool isDefaultToken(std::wstring_view value) {
+    const std::wstring cleaned = trim(std::wstring(value));
+    return CompareStringOrdinal(cleaned.c_str(), -1, L"default", -1, TRUE) == CSTR_EQUAL;
+}
+
 constexpr std::uint64_t volumeExtScale = 100000000;
 
 std::wstring volumeText(std::uint64_t volumeExt) {
@@ -677,9 +682,15 @@ bool writeVolumeLots(std::wstring_view text,
                      VolumeExtGetter volumeExtGetter, VolumeExtSetter volumeExtSetter,
                      bool& changed, std::wstring& error) {
     std::uint64_t volumeExt = 0;
-    if (!parseVolumeLots(text, volumeExt, error)) return false;
+    const std::uint64_t defaultVolume = (std::numeric_limits<std::uint64_t>::max)();
+    if (isDefaultToken(text) || trim(std::wstring(text)) == volumeText(defaultVolume)) {
+        volumeExt = defaultVolume;
+    } else if (!parseVolumeLots(text, volumeExt, error)) {
+        return false;
+    }
 
-    const std::uint64_t volume = SMTMath::VolumeFromVolumeExt(volumeExt);
+    const std::uint64_t volume = volumeExt == defaultVolume
+        ? defaultVolume : SMTMath::VolumeFromVolumeExt(volumeExt);
     const std::uint64_t oldVolume = volumeGetter();
     const std::uint64_t oldVolumeExt = volumeExtGetter();
     if (volume == oldVolume && volumeExt == oldVolumeExt) return true;
@@ -955,12 +966,14 @@ void writeDefaultGroupValueMaps(std::ostream& output) {
               "1=Instant\n"
               "2=Market\n"
               "3=Exchange\n"
+              "4294967295=default\n"
               "\n[ValueMap.TradeMode]\n"
               "0=Disabled\n"
               "1=Long only\n"
               "2=Short only\n"
               "3=Close only\n"
               "4=Full access\n"
+              "4294967295=default\n"
               "\n[ValueMap.SwapMode]\n"
               "0=Disabled\n"
               "1=Points\n"
@@ -972,6 +985,7 @@ void writeDefaultGroupValueMaps(std::ostream& output) {
               "7=Reopen by close price\n"
               "8=Reopen by bid\n"
               "9=Profit currency\n"
+              "4294967295=default\n"
               "\n[ValueMap.Swap3Day]\n"
               "0=Sunday\n"
               "1=Monday\n"
@@ -981,19 +995,23 @@ void writeDefaultGroupValueMaps(std::ostream& output) {
               "5=Friday\n"
               "6=Saturday\n"
               "7=Disabled\n"
+              "2147483647=default\n"
               "\n[ValueMap.IECheckMode]\n"
               "0=Normal\n"
+              "4294967295=default\n"
               "\n[FlagMap.FillFlags]\n"
               "0=None\n"
               "1=FOK\n"
               "2=IOC\n"
               "4=BOC\n"
+              "4294967295=default\n"
               "\n[FlagMap.ExpirFlags]\n"
               "0=None\n"
               "1=GTC\n"
               "2=Day\n"
               "4=Specified\n"
               "8=Specified day\n"
+              "4294967295=default\n"
               "\n[FlagMap.OrderFlags]\n"
               "0=None\n"
               "1=Market\n"
@@ -1003,6 +1021,7 @@ void writeDefaultGroupValueMaps(std::ostream& output) {
               "16=SL\n"
               "32=TP\n"
               "64=Close by\n"
+              "4294967295=default\n"
               "\n[FlagMap.MarginFlags]\n"
               "0=None\n"
               "1=Check process\n"
@@ -1010,18 +1029,24 @@ void writeDefaultGroupValueMaps(std::ostream& output) {
               "4=Hedge large leg\n"
               "8=Exclude P/L\n"
               "16=Recalculate rates\n"
+              "4294967295=default\n"
               "\n[FlagMap.REFlags]\n"
               "0=None\n"
               "1=Order confirmation\n"
+              "4294967295=default\n"
               "\n[FlagMap.PermissionsFlags]\n"
-              "0=None\n"
-              "1=Allow books\n"
+              "0=Disable\n"
+              "1=Enable\n"
+              "\n[ValueMap.BookDepthLimit]\n"
+              "0=unlimited\n"
               "\n[FlagMap.IEFlags]\n"
               "0=None\n"
               "1=Fast confirmation\n"
+              "4294967295=default\n"
               "\n[FlagMap.SwapFlags]\n"
               "0=None\n"
-              "1=Consider holidays\n";
+              "1=Consider holidays\n"
+              "4294967295=default\n";
 }
 
 bool writeDefaultGroupOnlyConfig(const std::wstring& path,
@@ -1047,6 +1072,62 @@ bool writeDefaultGroupOnlyConfig(const std::wstring& path,
 std::wstring serverValueForField(const SymbolFieldMapping& mapping,
                                  const std::wstring& value) {
     return SymbolValueForStorage(mapping, value);
+}
+
+std::wstring defaultSentinelText(SymbolFieldValueKind valueKind) {
+    switch (valueKind) {
+    case SymbolFieldValueKind::SignedInteger32:
+        return std::to_wstring((std::numeric_limits<std::int32_t>::max)());
+    case SymbolFieldValueKind::UnsignedInteger32:
+        return std::to_wstring((std::numeric_limits<std::uint32_t>::max)());
+    case SymbolFieldValueKind::SignedInteger64:
+        return std::to_wstring((std::numeric_limits<std::int64_t>::max)());
+    case SymbolFieldValueKind::UnsignedInteger64:
+        return std::to_wstring((std::numeric_limits<std::uint64_t>::max)());
+    case SymbolFieldValueKind::FloatingPoint:
+        return numberText((std::numeric_limits<double>::max)());
+    case SymbolFieldValueKind::VolumeLots:
+        return volumeText((std::numeric_limits<std::uint64_t>::max)());
+    default:
+        return L"default";
+    }
+}
+
+bool isDefaultSentinel(const SymbolFieldMapping& mapping, std::wstring_view value) {
+    if (!mapping.supportsDefault) return false;
+    const std::wstring cleaned = trim(std::wstring(value));
+    switch (mapping.valueKind) {
+    case SymbolFieldValueKind::SignedInteger32: {
+        std::int32_t parsed = 0;
+        return parseFieldNumber(cleaned, parsed) &&
+            parsed == (std::numeric_limits<std::int32_t>::max)();
+    }
+    case SymbolFieldValueKind::UnsignedInteger32: {
+        std::uint32_t parsed = 0;
+        return parseFieldNumber(cleaned, parsed) &&
+            parsed == (std::numeric_limits<std::uint32_t>::max)();
+    }
+    case SymbolFieldValueKind::SignedInteger64: {
+        std::int64_t parsed = 0;
+        return parseFieldNumber(cleaned, parsed) &&
+            parsed == (std::numeric_limits<std::int64_t>::max)();
+    }
+    case SymbolFieldValueKind::UnsignedInteger64: {
+        std::uint64_t parsed = 0;
+        return parseFieldNumber(cleaned, parsed) &&
+            parsed == (std::numeric_limits<std::uint64_t>::max)();
+    }
+    case SymbolFieldValueKind::FloatingPoint: {
+        const double maximum = (std::numeric_limits<double>::max)();
+        if (cleaned == numberText(maximum) || cleaned == precision8NumberText(maximum)) return true;
+        double parsed = 0;
+        return parseFieldNumber(cleaned, parsed) && parsed == maximum;
+    }
+    case SymbolFieldValueKind::VolumeLots:
+        return cleaned == volumeText((std::numeric_limits<std::uint64_t>::max)());
+    default:
+        return false;
+    }
 }
 
 bool writeDefaultSymbolMappings(const std::wstring& path,
@@ -1466,6 +1547,7 @@ struct GroupProperty {
     std::function<bool(IMTConGroupSymbol&, std::wstring_view,
                        bool&, std::wstring&)> write;
     SymbolFieldValueKind valueKind = SymbolFieldValueKind::Text;
+    bool supportsDefault = false;
 };
 
 std::vector<GroupProperty> makeGroupProperties() {
@@ -1484,7 +1566,16 @@ std::vector<GroupProperty> makeGroupProperties() {
             return writeNumber(text, [&]() { return symbol.name(); }, \
                 [&](auto value) { return symbol.name(value); }, changed, error); \
         }, \
-        numericValueKind<decltype(std::declval<const IMTConGroupSymbol&>().name())>()})
+        numericValueKind<decltype(std::declval<const IMTConGroupSymbol&>().name())>(), true})
+#define ADD_GROUP_FIELD_NO_DEFAULT(name) \
+    properties.push_back({WIDEN(STRINGIFY(name)), \
+        [](const IMTConGroupSymbol& symbol) { return numberText(symbol.name()); }, \
+        [](IMTConGroupSymbol& symbol, std::wstring_view text, \
+           bool& changed, std::wstring& error) { \
+            return writeNumber(text, [&]() { return symbol.name(); }, \
+                [&](auto value) { return symbol.name(value); }, changed, error); \
+        }, \
+        numericValueKind<decltype(std::declval<const IMTConGroupSymbol&>().name())>(), false})
 #define ADD_GROUP_PRECISION8_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
         [](const IMTConGroupSymbol& symbol) { return precision8NumberText(symbol.name()); }, \
@@ -1492,7 +1583,7 @@ std::vector<GroupProperty> makeGroupProperties() {
            bool& changed, std::wstring& error) { \
             return writePrecision8Number(text, [&]() { return symbol.name(); }, \
                 [&](auto value) { return symbol.name(value); }, changed, error); \
-        }, SymbolFieldValueKind::FloatingPoint})
+        }, SymbolFieldValueKind::FloatingPoint, true})
 #define ADD_GROUP_VOLUME_FIELD(name) \
     properties.push_back({WIDEN(STRINGIFY(name)), \
         [](const IMTConGroupSymbol& symbol) { \
@@ -1509,7 +1600,7 @@ std::vector<GroupProperty> makeGroupProperties() {
                 [&]() { return symbol.name##Ext(); }, \
                 [&](std::uint64_t value) { return symbol.name##Ext(value); }, \
                 changed, error); \
-        }, SymbolFieldValueKind::VolumeLots})
+        }, SymbolFieldValueKind::VolumeLots, true})
 
     ADD_GROUP_FIELD(TradeMode);
     ADD_GROUP_FIELD(ExecMode);
@@ -1558,7 +1649,7 @@ std::vector<GroupProperty> makeGroupProperties() {
                     [&]() { return symbol.MarginRateInitial(type); },
                     [&](double value) { return symbol.MarginRateInitial(type, value); },
                     changed, error);
-            }, SymbolFieldValueKind::FloatingPoint});
+            }, SymbolFieldValueKind::FloatingPoint, true});
         properties.push_back({std::wstring(L"MarginRateMaintenance.") + marginRateNames[type],
             [type](const IMTConGroupSymbol& symbol) {
                 return precision8NumberText(symbol.MarginRateMaintenance(type));
@@ -1569,15 +1660,15 @@ std::vector<GroupProperty> makeGroupProperties() {
                     [&]() { return symbol.MarginRateMaintenance(type); },
                     [&](double value) { return symbol.MarginRateMaintenance(type, value); },
                     changed, error);
-            }, SymbolFieldValueKind::FloatingPoint});
+            }, SymbolFieldValueKind::FloatingPoint, true});
     }
 
     ADD_GROUP_PRECISION8_FIELD(MarginRateLiquidity);
     ADD_GROUP_FIELD(REFlags);
     ADD_GROUP_PRECISION8_FIELD(MarginHedged);
-    ADD_GROUP_FIELD(PermissionsFlags);
+    ADD_GROUP_FIELD_NO_DEFAULT(PermissionsFlags);
     ADD_GROUP_PRECISION8_FIELD(MarginRateCurrency);
-    ADD_GROUP_FIELD(BookDepthLimit);
+    ADD_GROUP_FIELD_NO_DEFAULT(BookDepthLimit);
     ADD_GROUP_FIELD(IEFlags);
     ADD_GROUP_FIELD(SwapYearDays);
     ADD_GROUP_FIELD(SwapFlags);
@@ -1591,6 +1682,7 @@ std::vector<GroupProperty> makeGroupProperties() {
 
 #undef ADD_GROUP_VOLUME_FIELD
 #undef ADD_GROUP_PRECISION8_FIELD
+#undef ADD_GROUP_FIELD_NO_DEFAULT
 #undef ADD_GROUP_FIELD
 #undef WIDEN
 #undef WIDEN_INNER
@@ -1607,6 +1699,7 @@ std::vector<SymbolFieldMapping> defaultGroupSymbolFieldMappings() {
     for (const GroupProperty& property : properties) {
         SymbolFieldMapping mapping{property.name, property.name};
         mapping.valueKind = property.valueKind;
+        mapping.supportsDefault = property.supportsDefault;
         mapping.dividerBefore = property.name == L"MarginInitial" ||
             property.name == L"SwapMode" || property.name == L"MarginRateLiquidity" ||
             property.name == L"SwapYearDays";
@@ -1898,6 +1991,7 @@ std::wstring backupFilePath(const std::wstring& directory) {
 std::wstring SymbolValueForDisplay(const SymbolFieldMapping& mapping,
                                    const std::wstring& value) {
     const std::wstring cleaned = trim(value);
+    if (isDefaultSentinel(mapping, cleaned)) return L"default";
     if (!mapping.textMappings.empty()) {
         std::wstring canonical;
         if (!canonicalAlpha3Code(cleaned, canonical)) return value;
@@ -1943,6 +2037,9 @@ std::wstring SymbolValueForDisplay(const SymbolFieldMapping& mapping,
 std::wstring SymbolValueForStorage(const SymbolFieldMapping& mapping,
                                    const std::wstring& value) {
     const std::wstring cleaned = trim(value);
+    if (mapping.supportsDefault && isDefaultToken(cleaned)) {
+        return defaultSentinelText(mapping.valueKind);
+    }
     if (!mapping.textMappings.empty()) {
         for (const auto& [code, label] : mapping.textMappings) {
             if (equalsIgnoreCase(cleaned, label)) return code;
@@ -2007,6 +2104,10 @@ bool ValidateSymbolFieldValue(const SymbolFieldMapping& mapping,
         error = L"Value exceeds the configured maxChars limit of " +
             std::to_wstring(constraint.maxChars) + L".";
         return false;
+    }
+    if (mapping.supportsDefault &&
+        (isDefaultToken(value) || isDefaultSentinel(mapping, value))) {
+        return true;
     }
 
     const bool needsNumber = constraint.hasMinimum || constraint.hasMaximum ||
@@ -2266,16 +2367,28 @@ bool LoadSymbolFieldMappings(const std::wstring& path,
                 if (heading != mappings.end()) sourceName = heading->sourceName;
             }
             if (sourceName.empty()) {
-                error = L"Unknown map field '" + requestedField + L"' on line " +
-                    std::to_wstring(lineNumber) + L" in " + path;
-                return false;
+                const bool isGroupSymbolField = std::any_of(defaultGroupMappings.begin(),
+                    defaultGroupMappings.end(), [&requestedField](const SymbolFieldMapping& mapping) {
+                        return mapping.sourceName == requestedField;
+                    });
+                if (!isGroupSymbolField) {
+                    error = L"Unknown map field '" + requestedField + L"' on line " +
+                        std::to_wstring(lineNumber) + L" in " + path;
+                    return false;
+                }
+                // These map sections belong to [GroupSymbolFields] and are loaded
+                // by LoadGroupSymbolFieldMappings below. They are not regular
+                // symbol fields, so the legacy symbol-config parser must skip them.
+                activeMapSource.clear();
+                activeMapKind = MappingKind::Ignore;
+            } else {
+                if (!seenMapSections.insert(sourceName).second) {
+                    error = L"Duplicate map section for '" + sourceName + L"' in " + path;
+                    return false;
+                }
+                activeMapSource = std::move(sourceName);
+                activeMapKind = mapKind;
             }
-            if (!seenMapSections.insert(sourceName).second) {
-                error = L"Duplicate map section for '" + sourceName + L"' in " + path;
-                return false;
-            }
-            activeMapSource = std::move(sourceName);
-            activeMapKind = mapKind;
             }
         } else if (activeMapKind == MappingKind::Ignore) {
             // Group symbol mappings are loaded separately from this file.
@@ -2581,6 +2694,7 @@ bool LoadGroupSymbolFieldMappings(const std::wstring& path,
                 const auto property = std::find_if(properties.begin(), properties.end(),
                     [&mapping](const GroupProperty& item) { return item.name == mapping.sourceName; });
                 mapping.valueKind = property->valueKind;
+                mapping.supportsDefault = property->supportsDefault;
             }
             mappings.push_back(std::move(mapping));
             dividerPending = false;
@@ -2662,6 +2776,9 @@ bool LoadGroupSymbolFieldMappings(const std::wstring& path,
         mapping.flagMappings = commonFlags[mapping.sourceName];
         mapping.textMappings = commonTexts[mapping.sourceName];
     }
+    SymbolFieldMapping groupPathMapping{L"GroupPath", L"Group Path"};
+    groupPathMapping.valueKind = SymbolFieldValueKind::Text;
+    mappings.insert(mappings.begin(), std::move(groupPathMapping));
     return true;
 }
 
@@ -2868,12 +2985,16 @@ bool LoadGroupSymbolPathsSnapshot(const std::wstring& server,
     snapshot.columns.push_back(L"Group Path");
     snapshot.sourceNames.push_back(L"GroupPath");
     const std::vector<GroupProperty> groupProperties = makeGroupProperties();
-    snapshot.columns.reserve(fieldMappings.size() + 1);
-    snapshot.sourceNames.reserve(fieldMappings.size() + 1);
+    std::vector<const SymbolFieldMapping*> ruleMappings;
+    ruleMappings.reserve(fieldMappings.size());
     for (const SymbolFieldMapping& mapping : fieldMappings) {
+        if (mapping.sourceName == L"GroupPath") continue;
+        ruleMappings.push_back(&mapping);
         snapshot.columns.push_back(mapping.displayName);
         snapshot.sourceNames.push_back(mapping.sourceName);
     }
+    snapshot.columns.reserve(ruleMappings.size() + 1);
+    snapshot.sourceNames.reserve(ruleMappings.size() + 1);
     std::wstring firstFailure;
     for (const std::wstring& groupName : groupNames) {
         MTAPIRES result = admin->GroupRequest(groupName.c_str(), group);
@@ -2917,10 +3038,11 @@ bool LoadGroupSymbolPathsSnapshot(const std::wstring& server,
             }
 
             std::vector<std::wstring> row;
-            row.reserve(1 + fieldMappings.size());
+            row.reserve(1 + ruleMappings.size());
             row.push_back(groupName);
             bool rowValid = true;
-            for (const SymbolFieldMapping& mapping : fieldMappings) {
+            for (const SymbolFieldMapping* mappingPointer : ruleMappings) {
+                const SymbolFieldMapping& mapping = *mappingPointer;
                 std::wstring value;
                 if (mapping.sourceName == L"Path") {
                     value = configuredPath;
@@ -3515,6 +3637,384 @@ static bool applyImportedSingleGroupSymbolSnapshot(const std::wstring& server,
     return true;
 }
 
+static bool applyImportedGroupRuleSnapshot(
+    const std::wstring& server,
+    const std::wstring& loginText,
+    const std::wstring& password,
+    const std::vector<SymbolFieldMapping>& fieldMappings,
+    const SymbolSnapshot& baselineSnapshot,
+    const SymbolSnapshot& importedSnapshot,
+    const std::wstring& backupDirectory,
+    const ApplyCheckpoint& checkpoint,
+    ApplyResult& result,
+    std::wstring& error) {
+    result = {};
+    error.clear();
+    if (fieldMappings.empty() || baselineSnapshot.rows.empty() || importedSnapshot.rows.empty() ||
+        fieldMappings.size() != baselineSnapshot.columns.size() ||
+        fieldMappings.size() != importedSnapshot.columns.size()) {
+        error = L"The group-symbol table is empty or its columns do not match symbols.ini.";
+        return false;
+    }
+
+    std::size_t groupPathColumn = fieldMappings.size();
+    std::size_t rulePathColumn = fieldMappings.size();
+    for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
+        if (fieldMappings[column].sourceName == L"GroupPath") groupPathColumn = column;
+        if (fieldMappings[column].sourceName == L"Path") rulePathColumn = column;
+    }
+    if (groupPathColumn == fieldMappings.size() || rulePathColumn == fieldMappings.size()) {
+        error = L"The group-symbol table must contain Group Path and Path columns.";
+        return false;
+    }
+
+    const auto rowKey = [groupPathColumn, rulePathColumn](const std::vector<std::wstring>& row) {
+        if (groupPathColumn >= row.size() || rulePathColumn >= row.size() ||
+            row[groupPathColumn].empty() || row[rulePathColumn].empty()) return std::wstring{};
+        return row[groupPathColumn] + L"\x1f" + row[rulePathColumn];
+    };
+
+    std::unordered_map<std::wstring, std::size_t> baselineRows;
+    baselineRows.reserve(baselineSnapshot.rows.size());
+    for (std::size_t index = 0; index < baselineSnapshot.rows.size(); ++index) {
+        const std::wstring key = rowKey(baselineSnapshot.rows[index]);
+        if (key.empty() || !baselineRows.emplace(key, index).second) {
+            error = L"The server snapshot contains an empty or duplicate Group Path/Path identity.";
+            return false;
+        }
+    }
+
+    const std::vector<GroupProperty> properties = makeGroupProperties();
+    std::unordered_map<std::wstring, const GroupProperty*> propertyByName;
+    propertyByName.reserve(properties.size());
+    for (const GroupProperty& property : properties) propertyByName.emplace(property.name, &property);
+
+    struct RulePlan {
+        std::size_t importRow = 0;
+        std::size_t baselineRow = 0;
+        std::uint32_t position = 0;
+        std::wstring groupPath;
+        std::wstring rulePath;
+        std::vector<std::size_t> changedColumns;
+    };
+    std::vector<RulePlan> plans;
+    std::unordered_map<std::size_t, std::size_t> planByRow;
+    std::unordered_set<std::size_t> skippedRows;
+    std::unordered_set<std::size_t> unchangedRows;
+    std::unordered_set<std::wstring> importedKeys;
+    importedKeys.reserve(importedSnapshot.rows.size());
+
+    for (std::size_t rowIndex = 0; rowIndex < importedSnapshot.rows.size(); ++rowIndex) {
+        const auto& row = importedSnapshot.rows[rowIndex];
+        if (row.size() != fieldMappings.size()) {
+            error = L"Every imported row must contain Group Path and all configured group-symbol fields.";
+            return false;
+        }
+        const std::wstring key = rowKey(row);
+        if (key.empty()) {
+            error = L"Every imported row must contain a Group Path and a Symbol path.";
+            return false;
+        }
+        if (!importedKeys.insert(key).second) {
+            error = L"The workbook contains a duplicate Group Path/Path row.";
+            return false;
+        }
+        const auto baseline = baselineRows.find(key);
+        if (baseline == baselineRows.end()) {
+            skippedRows.insert(rowIndex);
+            continue;
+        }
+        if (baseline->second >= baselineSnapshot.rows.size() ||
+            baselineSnapshot.rows[baseline->second].size() != fieldMappings.size()) {
+            error = L"The current server snapshot contains an incomplete group-symbol row.";
+            return false;
+        }
+        for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
+            if (column == groupPathColumn || column == rulePathColumn) continue;
+            const auto property = propertyByName.find(fieldMappings[column].sourceName);
+            if (property == propertyByName.end()) {
+                error = L"Field '" + fieldMappings[column].sourceName +
+                    L"' is not a group-symbol setting. No values were applied.";
+                return false;
+            }
+            std::wstring validationError;
+            const std::wstring storageValue = SymbolValueForStorage(fieldMappings[column], row[column]);
+            if (!ValidateSymbolFieldValue(fieldMappings[column], storageValue, validationError)) {
+                error = L"Group '" + row[groupPathColumn] + L"', path '" + row[rulePathColumn] +
+                    L"', field '" + fieldMappings[column].sourceName + L"': " + validationError +
+                    L" No values were applied.";
+                return false;
+            }
+        }
+    }
+
+    std::uint64_t login = 0;
+    if (!parseLogin(loginText, login)) {
+        error = L"Login must contain only digits and be greater than zero.";
+        return false;
+    }
+    if (server.empty() || password.empty()) {
+        error = L"Server and password must not be empty.";
+        return false;
+    }
+
+    ManagerConnection connection;
+    if (!connection.connect(server, login, password, error)) return false;
+    IMTManagerAPI* admin = connection.manager();
+    IMTConGroup* group = admin->GroupCreate();
+    IMTConGroupSymbol* groupSymbol = admin->GroupSymbolCreate();
+    if (!group || !groupSymbol) {
+        if (group) group->Release();
+        if (groupSymbol) groupSymbol->Release();
+        error = L"MT5 API could not create group-symbol update objects.";
+        return false;
+    }
+    const auto releaseObjects = [&]() {
+        groupSymbol->Release();
+        group->Release();
+    };
+
+    std::wstring loadedGroup;
+    for (std::size_t rowIndex = 0; rowIndex < importedSnapshot.rows.size(); ++rowIndex) {
+        if (skippedRows.contains(rowIndex)) continue;
+        const auto& row = importedSnapshot.rows[rowIndex];
+        const std::wstring& groupName = row[groupPathColumn];
+        const std::wstring& rulePath = row[rulePathColumn];
+        if (loadedGroup != groupName) {
+            const MTAPIRES requestResult = admin->GroupRequest(groupName.c_str(), group);
+            if (requestResult != MT_RET_OK) {
+                error = L"Could not load group '" + groupName + L"' for path preflight: " +
+                    apiError(L"GroupRequest", requestResult) + L" No values were applied.";
+                releaseObjects();
+                return false;
+            }
+            loadedGroup = groupName;
+        }
+        std::uint32_t position = (std::numeric_limits<std::uint32_t>::max)();
+        for (std::uint32_t index = 0; index < group->SymbolTotal(); ++index) {
+            const MTAPIRES nextResult = group->SymbolNext(index, groupSymbol);
+            if (nextResult != MT_RET_OK) {
+                error = L"Could not enumerate group '" + groupName + L"' Symbol paths: " +
+                    apiError(L"Group.SymbolNext", nextResult) + L" No values were applied.";
+                releaseObjects();
+                return false;
+            }
+            if (cleanText(groupSymbol->Path()) == rulePath) {
+                position = index;
+                break;
+            }
+        }
+        if (position == (std::numeric_limits<std::uint32_t>::max)()) {
+            error = L"Group '" + groupName + L"' no longer contains Symbol path '" + rulePath +
+                L"'. Refresh the server data before applying changes.";
+            releaseObjects();
+            return false;
+        }
+        const MTAPIRES getResult = group->SymbolGet(rulePath.c_str(), groupSymbol);
+        if (getResult != MT_RET_OK) {
+            error = L"Could not read group '" + groupName + L"' Symbol path '" + rulePath + L"': " +
+                apiError(L"Group.SymbolGet", getResult) + L" No values were applied.";
+            releaseObjects();
+            return false;
+        }
+
+        RulePlan plan;
+        plan.importRow = rowIndex;
+        plan.baselineRow = baselineRows.at(rowKey(row));
+        plan.position = position;
+        plan.groupPath = groupName;
+        plan.rulePath = rulePath;
+        for (std::size_t column = 0; column < fieldMappings.size(); ++column) {
+            if (column == groupPathColumn || column == rulePathColumn) continue;
+            const GroupProperty& property = *propertyByName.at(fieldMappings[column].sourceName);
+            const std::wstring currentValue = property.read(*groupSymbol);
+            if (currentValue != baselineSnapshot.rows[plan.baselineRow][column]) {
+                error = L"Group '" + groupName + L"', path '" + rulePath + L"', field '" +
+                    fieldMappings[column].sourceName +
+                    L"' changed on the server after it was loaded. Refresh before applying.";
+                releaseObjects();
+                return false;
+            }
+            bool changed = false;
+            std::wstring writeError;
+            const std::wstring value = SymbolValueForStorage(fieldMappings[column], row[column]);
+            if (!property.write(*groupSymbol, value, changed, writeError)) {
+                error = L"Group '" + groupName + L"', path '" + rulePath + L"', field '" +
+                    fieldMappings[column].sourceName + L"': " + writeError + L" No values were applied.";
+                releaseObjects();
+                return false;
+            }
+            if (changed) plan.changedColumns.push_back(column);
+        }
+        if (plan.changedColumns.empty()) {
+            unchangedRows.insert(rowIndex);
+        } else {
+            planByRow.emplace(rowIndex, plans.size());
+            plans.push_back(std::move(plan));
+        }
+    }
+
+    if (plans.empty()) {
+        result.unchanged = unchangedRows.size();
+        result.skipped = skippedRows.size();
+        releaseObjects();
+        return true;
+    }
+
+    std::error_code fsError;
+    std::filesystem::create_directories(std::filesystem::path(backupDirectory), fsError);
+    if (fsError || !std::filesystem::is_directory(std::filesystem::path(backupDirectory), fsError)) {
+        error = L"Cannot create the backup directory: " + backupDirectory;
+        releaseObjects();
+        return false;
+    }
+    result.backupPath = backupFilePath(backupDirectory);
+    if (!saveSnapshotCsv(baselineSnapshot, result.backupPath, error)) {
+        releaseObjects();
+        return false;
+    }
+
+    const auto updateRule = [&](const RulePlan& plan,
+                                const std::vector<std::wstring>& sourceRow,
+                                bool& submitted,
+                                std::wstring& updateError) {
+        submitted = false;
+        MTAPIRES apiResult = admin->GroupRequest(plan.groupPath.c_str(), group);
+        if (apiResult != MT_RET_OK) {
+            updateError = apiError(L"GroupRequest", apiResult);
+            return false;
+        }
+        std::uint32_t position = (std::numeric_limits<std::uint32_t>::max)();
+        for (std::uint32_t index = 0; index < group->SymbolTotal(); ++index) {
+            apiResult = group->SymbolNext(index, groupSymbol);
+            if (apiResult != MT_RET_OK) {
+                updateError = apiError(L"Group.SymbolNext", apiResult);
+                return false;
+            }
+            if (cleanText(groupSymbol->Path()) == plan.rulePath) {
+                position = index;
+                break;
+            }
+        }
+        if (position == (std::numeric_limits<std::uint32_t>::max)()) {
+            updateError = L"Symbol path no longer exists in the group.";
+            return false;
+        }
+        apiResult = group->SymbolGet(plan.rulePath.c_str(), groupSymbol);
+        if (apiResult != MT_RET_OK) {
+            updateError = apiError(L"Group.SymbolGet", apiResult);
+            return false;
+        }
+        for (const std::size_t column : plan.changedColumns) {
+            const GroupProperty& property = *propertyByName.at(fieldMappings[column].sourceName);
+            bool changed = false;
+            if (!property.write(*groupSymbol,
+                    SymbolValueForStorage(fieldMappings[column], sourceRow[column]),
+                    changed, updateError)) return false;
+        }
+        apiResult = group->SymbolUpdate(position, groupSymbol);
+        if (apiResult != MT_RET_OK) {
+            updateError = apiError(L"Group.SymbolUpdate", apiResult);
+            return false;
+        }
+        submitted = true;
+        apiResult = admin->GroupUpdate(group);
+        if (apiResult != MT_RET_OK) {
+            updateError = apiError(L"GroupUpdate", apiResult);
+            return false;
+        }
+        apiResult = admin->GroupRequest(plan.groupPath.c_str(), group);
+        if (apiResult != MT_RET_OK) {
+            updateError = apiError(L"GroupRequest verification", apiResult);
+            return false;
+        }
+        apiResult = group->SymbolGet(plan.rulePath.c_str(), groupSymbol);
+        if (apiResult != MT_RET_OK) {
+            updateError = apiError(L"Group.SymbolGet verification", apiResult);
+            return false;
+        }
+        for (const std::size_t column : plan.changedColumns) {
+            const GroupProperty& property = *propertyByName.at(fieldMappings[column].sourceName);
+            bool wouldChange = false;
+            std::wstring verifyError;
+            if (!property.write(*groupSymbol,
+                    SymbolValueForStorage(fieldMappings[column], sourceRow[column]),
+                    wouldChange, verifyError) || wouldChange) {
+                updateError = L"Field '" + fieldMappings[column].sourceName + L"' did not retain the requested value.";
+                if (!verifyError.empty()) updateError += L" " + verifyError;
+                return false;
+            }
+        }
+        return true;
+    };
+
+    std::vector<std::size_t> submittedPlans;
+    std::size_t processed = 0;
+    const std::size_t totalRows = importedSnapshot.rows.size();
+    for (std::size_t rowIndex = 0; rowIndex < totalRows; ++rowIndex) {
+        if (checkpoint) {
+            const ApplyChoice choice = checkpoint({processed, totalRows, false,
+                rowIndex < importedSnapshot.rows.size() && rulePathColumn < importedSnapshot.rows[rowIndex].size()
+                    ? importedSnapshot.rows[rowIndex][rulePathColumn] : L""});
+            if (choice != ApplyChoice::Continue) {
+                result.aborted = true;
+                result.restoreRequested = choice == ApplyChoice::StopAndRestore;
+                result.notProcessed = totalRows - processed;
+                break;
+            }
+        }
+        if (skippedRows.contains(rowIndex)) {
+            ++result.skipped;
+        } else if (unchangedRows.contains(rowIndex)) {
+            ++result.unchanged;
+        } else {
+            const RulePlan& plan = plans[planByRow.at(rowIndex)];
+            bool submitted = false;
+            std::wstring updateError;
+            if (updateRule(plan, importedSnapshot.rows[rowIndex], submitted, updateError)) {
+                ++result.applied;
+                submittedPlans.push_back(planByRow.at(rowIndex));
+            } else {
+                ++result.failed;
+                if (submitted) submittedPlans.push_back(planByRow.at(rowIndex));
+                if (result.firstFailure.empty()) {
+                    result.firstFailure = L"Group '" + plan.groupPath + L"', path '" +
+                        plan.rulePath + L"': " + updateError;
+                }
+            }
+        }
+        ++processed;
+    }
+    if (!result.aborted && checkpoint) {
+        const ApplyChoice choice = checkpoint({totalRows, totalRows, false, L""});
+        if (choice != ApplyChoice::Continue) {
+            result.aborted = true;
+            result.restoreRequested = choice == ApplyChoice::StopAndRestore;
+        }
+    }
+
+    if (result.restoreRequested) {
+        for (auto it = submittedPlans.rbegin(); it != submittedPlans.rend(); ++it) {
+            const RulePlan& plan = plans[*it];
+            bool submitted = false;
+            std::wstring restoreError;
+            if (updateRule(plan, baselineSnapshot.rows[plan.baselineRow], submitted, restoreError)) {
+                ++result.restored;
+            } else {
+                ++result.restoreFailed;
+                if (result.firstFailure.empty()) {
+                    result.firstFailure = L"Could not restore group '" + plan.groupPath +
+                        L"', path '" + plan.rulePath + L"': " + restoreError;
+                }
+            }
+            if (checkpoint) checkpoint({result.restored + result.restoreFailed,
+                submittedPlans.size(), true, plan.rulePath});
+        }
+    }
+    releaseObjects();
+    return true;
+}
+
 bool ApplyImportedGroupSymbolSnapshot(const std::wstring& server,
                                       const std::wstring& loginText,
                                       const std::wstring& password,
@@ -3525,6 +4025,15 @@ bool ApplyImportedGroupSymbolSnapshot(const std::wstring& server,
                                       const ApplyCheckpoint& checkpoint,
                                       ApplyResult& result,
                                       std::wstring& error) {
+    const bool hasSymbolField = std::any_of(fieldMappings.begin(), fieldMappings.end(),
+        [](const SymbolFieldMapping& mapping) { return mapping.sourceName == L"Symbol"; });
+    const bool hasPathField = std::any_of(fieldMappings.begin(), fieldMappings.end(),
+        [](const SymbolFieldMapping& mapping) { return mapping.sourceName == L"Path"; });
+    if (!hasSymbolField && hasPathField) {
+        return applyImportedGroupRuleSnapshot(server, loginText, password, fieldMappings,
+            baselineSnapshot, importedSnapshot, backupDirectory, checkpoint, result, error);
+    }
+
     result = {};
     error.clear();
     if (fieldMappings.empty() || baselineSnapshot.rows.empty() || importedSnapshot.rows.empty() ||
